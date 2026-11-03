@@ -1,0 +1,17 @@
+{
+  "mode": "ebpf-tc",
+  "duration_s": 10,
+  "tcp_gbps": 2.381,
+  "udp64_rx_pps": 138596,
+  "udp64_loss_pct": 0.0,
+  "rtt_min_ms": 0.004,
+  "rtt_avg_ms": 0.014,
+  "rtt_max_ms": 0.094,
+  "rtt_mdev_ms": 0.013,
+  "lb_rps": 524.3,
+  "lb_avg_ms": 1.905,
+  "lb_fail": 0,
+  "fw_drop_pps": 276990,
+  "fw_drop_sent": 861952,
+  "fw_dropped": 861952
+}

@@ -1,0 +1,11 @@
+{
+  "mode": "kernel",
+  "duration_s": 10,
+  "tcp_gbps": 3.172,
+  "udp64_rx_pps": 186564,
+  "udp64_loss_pct": 0.07,
+  "rtt_min_ms": 0.003,
+  "rtt_avg_ms": 0.011,
+  "rtt_max_ms": 0.081,
+  "rtt_mdev_ms": 0.008
+}

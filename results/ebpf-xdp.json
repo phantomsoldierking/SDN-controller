@@ -1,0 +1,17 @@
+{
+  "mode": "ebpf-xdp",
+  "duration_s": 10,
+  "tcp_gbps": 3.017,
+  "udp64_rx_pps": 147585,
+  "udp64_loss_pct": 0.71,
+  "rtt_min_ms": 0.011,
+  "rtt_avg_ms": 0.047,
+  "rtt_max_ms": 0.378,
+  "rtt_mdev_ms": 0.024,
+  "lb_rps": 389.5,
+  "lb_avg_ms": 2.564,
+  "lb_fail": 0,
+  "fw_drop_pps": 230537,
+  "fw_drop_sent": 721408,
+  "fw_dropped": 721408
+}
