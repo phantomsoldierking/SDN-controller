@@ -26,15 +26,16 @@ the CLI. This document is the long explanation.
 3. [Architecture](#3-architecture)
 4. [The test network](#4-the-test-network)
 5. [A packet's journey, step by step](#5-a-packets-journey-step-by-step)
-6. [Code walkthrough: `xdp_prog.c`](#6-code-walkthrough-xdp_progc)
-7. [Code walkthrough: `control_plane.py`](#7-code-walkthrough-control_planepy)
-8. [Code walkthrough: `topology.py`](#8-code-walkthrough-topologypy)
-9. [`benchmark.sh` and the `Makefile`](#9-benchmarksh-and-the-makefile)
-10. [Test results](#10-test-results)
-11. [Benchmark results and how to read them](#11-benchmark-results-and-how-to-read-them)
-12. [Problems found along the way and how they were fixed](#12-problems-found-along-the-way-and-how-they-were-fixed)
-13. [Limitations and possible extensions](#13-limitations-and-possible-extensions)
-14. [Glossary](#14-glossary)
+6. [Project layout](#6-project-layout)
+7. [Code walkthrough: the kernel data plane (`bpf/`)](#7-code-walkthrough-the-kernel-data-plane-bpf)
+8. [Code walkthrough: the control plane (`sdn/`)](#8-code-walkthrough-the-control-plane-sdn)
+9. [Code walkthrough: the testbed and test suites](#9-code-walkthrough-the-testbed-testbed-and-test-suites)
+10. [`benchmark.sh` and the `Makefile`](#10-benchmarksh-and-the-makefile)
+11. [Test results](#11-test-results)
+12. [Benchmark results and how to read them](#12-benchmark-results-and-how-to-read-them)
+13. [Problems found along the way and how they were fixed](#13-problems-found-along-the-way-and-how-they-were-fixed)
+14. [Limitations and possible extensions](#14-limitations-and-possible-extensions)
+15. [Glossary](#15-glossary)
 
 ---
 
@@ -284,7 +285,7 @@ Only the changed words matter, whatever the packet size. In this project:
   the `~old + new` part, and the code folds the result back into 16 bits.
 - **TC path:** `bpf_l3_csum_replace()` and `bpf_l4_csum_replace()` do the
   whole update. With the `BPF_F_PSEUDO_HDR` flag they also handle packets
-  whose checksum hasn't been finalised yet (checksum offload, see §12.3).
+  whose checksum hasn't been finalised yet (checksum offload, see §13.3).
 
 ---
 
@@ -358,7 +359,7 @@ two hosts crosses the gateway's data plane**. This is the "routed access"
 design used by Kubernetes CNIs such as Calico.
 
 Making this work with ordinary IP subnets takes three tricks, all set up in
-`setup_router()` ([topology.py:163](../topology.py:163)):
+`KernelGateway.start()` ([testbed/gateways.py](../testbed/gateways.py)):
 
 1. **The same gateway address on several interfaces.** `10.0.1.254/32` is
    added to each of `gw-eth0..3` and `10.0.2.254/32` to each of `gw-eth4..7`.
@@ -382,7 +383,7 @@ source was rewritten to the VIP, since the gateway has no route back to
 |---|---|---|
 | `ebpf` | A Linux host acting as a router | `xdp_prog.c` attached to all 8 gateway interfaces, plus the kernel's routing |
 | `kernel` | The same Linux router | Only the kernel's routing: no firewall, no LB. This is the "cost of doing nothing" baseline. |
-| `ovs` | An Open vSwitch bridge | OpenFlow 1.3 rules emulate the router, the firewall and the load balancer (§8.3) |
+| `ovs` | An Open vSwitch bridge | OpenFlow 1.3 rules emulate the router, the firewall and the load balancer (§9.2) |
 
 ---
 
@@ -451,19 +452,78 @@ The packet never reaches the kernel's IP stack.
 
 ---
 
-## 6. Code walkthrough: `xdp_prog.c`
+## 6. Project layout
 
-The file is organised top to bottom in pipeline order.
+```
+bpf/                    kernel data plane (one compilation unit → build/xdp_prog.o)
+  xdp_prog.c              the two entry points: xdp_dataplane, tc_dataplane
+  proto.h                 includes, protocol constants, ARP/VLAN header layouts
+  abi.h                   map key/value structs shared with Python
+  maps.h                  the nine BPF maps
+  pkt.h                   parsed-packet state and the pipeline verdict
+  util.h                  counters, flow hash, checksum folding
+  parser.h                Eth / VLAN / ARP / IPv4 / TCP / UDP / ICMP parser
+  firewall.h              stateful firewall
+  lb.h                    L4 load balancer
+  telemetry.h             per-flow counters
+  pipeline.h              the hook-independent pipeline
+  xdp_nat.h / tc_nat.h    hook-specific packet rewriting + FIB forwarding
+sdn/                    control plane (Python package)
+  abi.py codec.py         ABI mirror, wire-format conversions
+  libbpf.py maps.py       libbpf bindings, map backends
+  loader.py               build / load / attach / detach
+  dataplane/              config, firewall, loadbalancer, conntrack, telemetry + facade
+  api.py daemon.py cli.py REST API, daemon with reaper thread, CLI
+testbed/                Mininet testbed (Python package)
+  config.py net.py        addressing plan, topology construction
+  gateways.py             Gateway interface: kernel / eBPF / OVS implementations
+  backends.py             HTTP backends and probe client
+  scenarios.py            Tests 1-3
+  benchmark.py report.py  Test 4, PASS/FAIL bookkeeping
+  hosttools.py            standalone helper run inside Mininet hosts
+tests/                  automated tests
+  test_codec_abi.py       ABI sizes, byte order          (no root)
+  test_dataplane.py       control-plane logic            (no root, in-memory maps)
+  test_api.py             REST API over a real socket    (no root)
+  test_bpf_dataplane.py   kernel programs, both hooks    (root, BPF_PROG_TEST_RUN)
+control_plane.py        thin entry point → sdn.cli
+topology.py             thin entry point → testbed
+benchmark.sh            Test 4 across all configurations
+```
 
-### 6.1 Shared ABI ([xdp_prog.c:59-197](../xdp_prog.c:59))
+Three design rules hold across the project:
+
+1. **One responsibility per file.** Each C header is one pipeline stage, each
+   Python module is one concern (bindings, maps, a single feature, a single
+   front end).
+2. **Dependencies point one way.**
+   - In C: `proto.h` → `abi.h` → `maps.h` → stages → `pipeline.h` → hooks.
+   - In Python: `abi` → `codec` → `maps` → `dataplane` → `api`/`daemon`/`cli`.
+   - Nothing lower down imports anything higher up. The one exception is the
+     loader, which imports `dataplane` lazily to write the initial config.
+3. **Logic depends on interfaces, not on the kernel.**
+   - Every data-plane manager takes a `MapBackend` instead of opening kernel
+     maps itself, so the same code runs against real pinned maps
+     (`BpfMap`) or an in-memory `DictMap` in unit tests.
+   - Every testbed scenario talks to a `Gateway` interface, so one test
+     works against the eBPF, kernel and OVS gateways.
+
+---
+
+## 7. Code walkthrough: the kernel data plane (`bpf/`)
+
+BPF needs one ELF object, so `xdp_prog.c` includes the headers below and
+everything compiles as a single translation unit. Each header has include
+guards and includes what it uses, so the dependency order is explicit.
+
+### 7.1 Shared ABI ([bpf/abi.h](../bpf/abi.h))
 
 The structs that serve as map keys and values are the **contract** between C
 and Python. Every struct is padded explicitly, for example `__u8 pad[2]`, so
-there is no compiler-inserted padding. `control_plane.py` defines the same
-structs with `ctypes` and checks the sizes at import time
-(`assert ct.sizeof(FlowKey) == 16`, and so on). If the two sides ever drift
-apart, the control plane refuses to start instead of silently corrupting
-maps.
+there is no compiler-inserted padding. [sdn/abi.py](../sdn/abi.py) defines
+the same structs with `ctypes` and checks every size at import time. If the
+two sides ever drift apart, the control plane refuses to start instead of
+silently corrupting maps.
 
 The key structs are:
 
@@ -474,7 +534,7 @@ The key structs are:
   5-tuple and two MAC addresses. Unused fields are zero, and zero means
   "wildcard" in the lookup order.
 
-### 6.2 Maps ([xdp_prog.c:199-260](../xdp_prog.c:199))
+### 7.2 Maps ([bpf/maps.h](../bpf/maps.h))
 
 These are declared in libbpf's BTF style:
 
@@ -490,7 +550,7 @@ struct {
 libbpf reads the `.maps` section and creates each map at load time, or reuses
 an existing pinned map with the same name.
 
-### 6.3 Helpers ([xdp_prog.c:302-355](../xdp_prog.c:302))
+### 7.3 Helpers ([bpf/util.h](../bpf/util.h))
 
 - `stat_add()` increments a per-CPU counter. It needs no atomic operation
   because each CPU owns its copy.
@@ -502,7 +562,7 @@ an existing pinned map with the same name.
 - `csum_fold()` folds a 32-bit ones'-complement sum into 16 bits and inverts
   it. The fixed 4-iteration `#pragma unroll` loop keeps the verifier happy.
 
-### 6.4 Parser ([xdp_prog.c:374-470](../xdp_prog.c:374))
+### 7.4 Parser ([bpf/parser.h](../bpf/parser.h))
 
 `parse_packet(data, data_end, &p)` takes only raw pointers, so the same code
 works for XDP (`ctx->data`) and TC (`skb->data`). In order:
@@ -524,7 +584,7 @@ Each step returns early on failure. Because every pointer is checked against
 `data_end` before use, the verifier can prove there are no out-of-bounds
 reads.
 
-### 6.5 Stateful firewall ([xdp_prog.c:490-645](../xdp_prog.c:490))
+### 7.5 Stateful firewall ([bpf/firewall.h](../bpf/firewall.h))
 
 `fw_lookup()` tries up to 9 keys, most specific first, and stops at the first
 hit:
@@ -553,7 +613,7 @@ because rules are shared across CPUs).
   direction of an existing entry, it sets the `REPLY` flag on that entry
   instead of creating a second one.
 
-### 6.6 Load balancer ([xdp_prog.c:648-784](../xdp_prog.c:648))
+### 7.6 Load balancer ([bpf/lb.h](../bpf/lb.h))
 
 `load_balance()` handles both directions.
 
@@ -578,9 +638,9 @@ because rules are shared across CPUs).
 from `{backend IP, port}` back to `{VIP, VIP port}`.
 
 The function only *decides*. The actual packet rewrite happens in the
-hook-specific code (§6.9), because XDP and TC rewrite packets differently.
+hook-specific code (§7.9), because XDP and TC rewrite packets differently.
 
-### 6.7 Telemetry ([xdp_prog.c:786-805](../xdp_prog.c:786))
+### 7.7 Telemetry ([bpf/telemetry.h](../bpf/telemetry.h))
 
 The flow key is hashed to one of 1024 slots in the per-CPU `flow_stats`
 array. If the slot holds a different flow (a hash collision), the new flow
@@ -588,15 +648,15 @@ takes it over and the counters reset. Packets and bytes are then added, and
 `last_seen` is updated. This bounded, lock-free design suits telemetry; exact
 per-connection numbers are kept in the conntrack maps.
 
-### 6.8 The shared pipeline ([xdp_prog.c:807-848](../xdp_prog.c:807))
+### 7.8 The shared pipeline ([bpf/pipeline.h](../bpf/pipeline.h))
 
 `pipeline()` calls everything above in order: config lookup, timestamp
 (`bpf_ktime_get_ns()`), parse, counters, telemetry, firewall, load balancer.
-It fills a `struct verdict` `{drop, nat kind, old/new address, old/new port}`.
-Both entry points call this one function, so XDP and TC behave identically by
-construction.
+It fills a `struct verdict` (from [bpf/pkt.h](../bpf/pkt.h))
+`{drop, nat kind, old/new address, old/new port}`. Both entry points call
+this one function, so XDP and TC behave identically by construction.
 
-### 6.9 XDP entry point ([xdp_prog.c:850-984](../xdp_prog.c:850))
+### 7.9 XDP rewriting ([bpf/xdp_nat.h](../bpf/xdp_nat.h))
 
 `xdp_apply_nat()` rewrites the packet in place, through the bounds-checked
 header pointers from the parser:
@@ -628,13 +688,7 @@ If the TTL is 1, or there's no neighbour entry yet, it returns `XDP_PASS` and
 lets the stack handle it. That way TTL-exceeded errors and ARP resolution
 still work.
 
-`xdp_dataplane()` itself is short: run the pipeline, then drop if the verdict
-says so, then apply NAT, then either FIB-forward or `XDP_PASS`.
-
-### 6.10 TC entry point ([xdp_prog.c:986-1101](../xdp_prog.c:986))
-
-`tc_dataplane()` first calls `bpf_skb_pull_data()` if the headers might sit
-in the non-linear part of the `sk_buff`. Then it runs the same pipeline.
+### 7.10 TC rewriting ([bpf/tc_nat.h](../bpf/tc_nat.h))
 
 `tc_apply_nat()` uses the skb helpers named in the task:
 
@@ -647,7 +701,7 @@ bpf_skb_store_bytes(skb, port_off, &new_port, 2, 0);
 ```
 
 These helpers take byte offsets rather than pointers, and they understand
-`CHECKSUM_PARTIAL` packets (§12.3), so TC NAT is correct even with checksum
+`CHECKSUM_PARTIAL` packets (§13.3), so TC NAT is correct even with checksum
 offload on. `BPF_F_MARK_MANGLED_0` keeps the UDP "no checksum" rule.
 
 `tc_fib_forward()` works like the XDP version, but reads the IP header with
@@ -657,111 +711,145 @@ helpers above modify the packet). It updates the TTL's checksum word with
 veth works reliably from TC, which is why `ebpf-tc-fib` is a benchmark
 configuration.
 
+### 7.11 Entry points ([bpf/xdp_prog.c](../bpf/xdp_prog.c))
+
+Both programs are short and identical in shape:
+
+1. Run the pipeline.
+2. Drop if the verdict says so.
+3. Apply NAT with the hook's rewriter.
+4. Either FIB-forward, or pass the packet on (`XDP_PASS` / `TC_ACT_OK`).
+
+`tc_dataplane()` also calls `bpf_skb_pull_data()` first, in case the headers
+sit in the non-linear part of the `sk_buff`.
+
 ---
 
-## 7. Code walkthrough: `control_plane.py`
+## 8. Code walkthrough: the control plane (`sdn/`)
 
-### 7.1 Talking to libbpf without BCC ([control_plane.py:212-260](../control_plane.py:212))
+### 8.1 Talking to libbpf without BCC ([sdn/libbpf.py](../sdn/libbpf.py))
 
 The task allowed BCC or libbpf. BCC compiles C at runtime with its own macro
 dialect, which conflicts with a normal `clang -target bpf` build. So the
 control plane calls the system's **libbpf.so.1 directly through Python's
-`ctypes`**. The `Libbpf` class declares the argument and return types for
-about 20 libbpf functions (`bpf_object__open_file`, `bpf_xdp_attach`,
-`bpf_tc_attach`, `bpf_map_update_elem`, …). Pointer-returning functions are
-declared `c_void_p`, which avoids 64-bit pointer truncation, a classic
-`ctypes` bug. `check()` turns negative errno results into readable
-exceptions.
+`ctypes`**:
 
-The `TcHook` and `TcOpts` ctypes structs mirror libbpf's
-`struct bpf_tc_hook` and `struct bpf_tc_opts` exactly. Their `sz` field
-carries the struct size, as libbpf's versioned-options convention requires.
+- **Function signatures.** A `_SIGNATURES` table declares the argument and
+  return types for every libbpf function used. Pointer-returning functions
+  are declared `c_void_p`, which avoids 64-bit pointer truncation, a classic
+  `ctypes` bug.
+- **Error handling.** `check()` turns negative errno results into
+  `BpfError`, and `quiet()` is a context manager that silences libbpf's own
+  logging.
+- **Option structs.** The `TcHook`, `TcOpts` and `TestRunOpts` ctypes structs
+  mirror libbpf's `bpf_tc_hook`, `bpf_tc_opts` and `bpf_test_run_opts`
+  exactly. Their `sz` field carries the struct size, as libbpf's
+  versioned-options convention requires.
 
-### 7.2 ABI mirror ([control_plane.py:66-142](../control_plane.py:66))
+### 8.2 ABI mirror and codec ([sdn/abi.py](../sdn/abi.py), [sdn/codec.py](../sdn/codec.py))
 
-`FlowKey`, `FwKey`, `LbCt` and the rest are `ctypes.Structure` copies of the
-C structs, followed by an `assert` on every size. The `MAPS` dictionary maps
-each map name to its key type, value type and whether it is per-CPU.
+- **`abi.py`** holds the `ctypes` copies of the C structs, `IntEnum`s for
+  actions, protocols and rule kinds, and `MAP_SPECS`. That's a table of
+  `MapSpec(key, value, percpu)` for each map. Struct sizes are checked at
+  import time.
+- **`codec.py`** converts at the edges. `ip_to_wire("10.0.2.3")` produces the
+  integer whose in-memory little-endian bytes equal the on-wire bytes, which
+  is exactly what the kernel program compares against. The module also
+  handles MAC addresses, protocol names, `ip:port` endpoints and
+  conntrack-flag formatting.
 
-Byte-order helpers ([control_plane.py:147-195](../control_plane.py:147))
-convert at the edges. `ip2be("10.0.2.3")` produces the integer whose in-memory
-little-endian bytes equal the on-wire bytes, which is exactly what the kernel
-program compares against.
+### 8.3 Map backends ([sdn/maps.py](../sdn/maps.py))
 
-### 7.3 Build, load, attach ([control_plane.py:272-375](../control_plane.py:272))
+`MapBackend` is a `Protocol` with `lookup`, `update`, `delete`, `keys` and
+`items`. It has two implementations:
 
-`build()` recompiles `xdp_prog.o` only if the C source is newer.
+- **`BpfMap`** opens a pinned map with `bpf_obj_get(path)`. For per-CPU maps,
+  the kernel returns one value per *possible* CPU, each padded to 8 bytes,
+  and `BpfMap` splits that buffer into a list.
+- **`DictMap`** is an in-memory stand-in. It stores keys and values as raw
+  bytes, so callers get independent copies exactly as with a kernel map.
 
-`load_and_attach()`:
+The unit tests use `DictMap` to exercise every manager without root.
+
+### 8.4 Build, load, attach ([sdn/loader.py](../sdn/loader.py))
+
+`build()` recompiles `build/xdp_prog.o` only if any file in `bpf/` is newer.
+
+`LoadedObject` is a context manager around one loaded BPF object:
 
 1. Opens the object file.
-2. For every map, sets a pin path under `/sys/fs/bpf/sdn_dp/`. If a pinned
-   map already exists, libbpf **reuses** it, so attaching to more interfaces
+2. For every map, sets a pin path under the pin directory. If a pinned map
+   already exists, libbpf **reuses** it, so attaching to more interfaces
    later (or reloading) keeps all rules and state.
-3. Enables autoload only for the program that matches `--hook`, so a TC-only
+3. Enables autoload only for the program that matches the hook, so a TC-only
    problem can never block an XDP load, and the other way round.
 4. Calls `bpf_object__load()`. This is where the verifier runs.
-5. Attaches to each interface: `bpf_xdp_attach(ifindex, fd, mode)` for XDP,
-   or for TC, `bpf_tc_hook_create` (creates the clsact qdisc) plus
-   `bpf_tc_attach`.
-6. Writes the initial config: default action, stateful flag and FIB-forward
-   flag.
-7. Closes the object. Both attachment types are held by the kernel, so the
-   program keeps running after the loader exits.
+5. `attach(iface)` attaches the program to an interface:
+   `bpf_xdp_attach(ifindex, fd, mode)` for XDP, or for TC,
+   `bpf_tc_hook_create` (creates the clsact qdisc) plus `bpf_tc_attach`.
 
-`detach()` removes both hook types and unpins the maps. It temporarily
-silences libbpf's logging, since "there was nothing attached here" is not an
-error worth printing.
+`load_and_attach(ifaces, AttachOptions)` uses it, then writes the initial
+configuration through the `DataPlane`. Closing the object afterwards is
+safe: both attachment types are held by the kernel, so the program keeps
+running after the loader exits.
 
-### 7.4 Map access ([control_plane.py:378-428](../control_plane.py:378))
+`detach()` removes both hook types inside `quiet()` and unpins the maps.
 
-`BpfMap` opens a pinned map with `bpf_obj_get(path)` and wraps lookup,
-update, delete and iteration (`bpf_map_get_next_key`). For per-CPU maps, the
-kernel returns one value per *possible* CPU, each padded to 8 bytes.
-`_percpu_values()` splits that buffer into a list.
+### 8.5 Data-plane managers ([sdn/dataplane/](../sdn/dataplane/__init__.py))
 
-### 7.5 `DataPlane`: all operations in one place ([control_plane.py:431-678](../control_plane.py:431))
+`DataPlane` is a facade that owns one manager per feature. All managers share
+one re-entrant lock, so the REST API, the CLI and the reaper thread can run
+in one process.
 
-Both the CLI and the REST API call these methods, so there is one
-implementation of every operation:
-
-| Method | What it does |
-|---|---|
-| `fw_add` / `fw_del` / `fw_list` / `fw_flush` | Convert a rule dict (src, dst, proto, ports, MACs, `bidir`, action) into one or two `FwKey`s and write them. Invalid combinations, such as ports without TCP/UDP, are rejected with a clear message. |
-| `_flush_ct_matching` | After adding a **drop** rule, deletes matching conntrack entries, so already-established connections can't keep using a now-forbidden path |
-| `lb_add_service` | Allocates a free service id, writes up to 16 backends into the array slots `id*16 … id*16+15` (clearing unused slots), then publishes the service. Backends are written *before* the service, so the data plane never sees a service with an empty pool. |
-| `lb_set_backend_state` | Flips a backend's `active` flag. This drains it from new connections, and the data plane also re-places existing connections on its next packet. |
-| `ct_list` / `ct_flush` | Show or clear the three connection tables |
-| `ct_gc` | Deletes entries idle longer than `idle_timeout`, or `fin_timeout` once FIN/RST was seen, or older than `hard_timeout`. Deleting an LB entry also deletes its reverse-NAT partner. |
-| `stats` / `flows` | Sum the per-CPU counters, and merge per-CPU flow slots by key into a top-N list |
+| Manager | File | What it does |
+|---|---|---|
+| `dp.config` | `config.py` | `apply(default_action=, fib_forward=, stateful=)` changes only the settings given; `describe()` reads them back |
+| `dp.firewall` | `firewall.py` | `FirewallRule` is a dataclass that validates itself and produces its map keys (`bidir` adds the reverse direction with ports swapped). `Firewall.add` writes the keys; for a **drop** rule it also calls `conntrack.flush_matching`, so established connections can't keep using a now-forbidden path. |
+| `dp.lb` | `loadbalancer.py` | `add_service` allocates a service id, writes up to 16 backends into slots `id*16 … id*16+15` (clearing unused slots), then publishes the service. Backends go in *before* the service, so the data plane never sees a service with an empty pool. `set_backend_state` drains or restores a backend. |
+| `dp.conntrack` | `conntrack.py` | `list`, `flush`, `flush_matching` and `expire(Timeouts)`. `Timeouts.expired()` holds the expiry rule: idle longer than `idle`, or longer than `fin` once FIN/RST was seen, or older than `hard`. Expiring an LB entry also removes its reverse-NAT partner. |
+| `dp.telemetry` | `telemetry.py` | Sums the per-CPU counters and merges per-CPU flow slots by key into a top-N list |
 
 Time values compare `bpf_ktime_get_ns()` (written by the kernel) with Python's
 `time.clock_gettime_ns(CLOCK_MONOTONIC)`. They use the same clock, so idle
-times are exact.
+times are exact. `expire()` also accepts `now_ns`, so the unit tests can
+check timeouts without sleeping.
 
-### 7.6 REST API and daemon ([control_plane.py:681-815](../control_plane.py:681))
+### 8.6 REST API and daemon ([sdn/api.py](../sdn/api.py), [sdn/daemon.py](../sdn/daemon.py))
 
-`Api` is a standard-library `BaseHTTPRequestHandler` with a route table
-(`GET /stats`, `POST /firewall`, `PUT /services/backend`, …). It speaks JSON
-in both directions and turns errors into HTTP 400 responses with a message.
-`run_daemon()` optionally loads and attaches, optionally loads services from
-`services.json`, starts the **GC thread** (`gc_loop`, runs every
-`--gc-interval` seconds), and serves the API with a threading HTTP server
-until it gets SIGTERM or SIGINT.
+`api.py` is a declarative `ROUTES` table mapping `(method, path)` to a
+handler `(DataPlane, body) -> result`. `make_handler()` builds a standard
+library `BaseHTTPRequestHandler` around it. It speaks JSON in both
+directions, turns input errors into HTTP 400 with a message, and answers
+unknown routes with 404 plus the list of valid ones.
 
-### 7.7 CLI ([control_plane.py:817-981](../control_plane.py:817))
+`daemon.py` has three parts:
 
-`argparse` subcommands (`build`, `load`, `unload`, `daemon`, `fw`, `lb`,
-`ct`, `stats`) map one-to-one onto the functions above. `print_table()`
-formats output; `stats --watch 1` gives a live view.
+- **`Reaper`** is a thread that calls `conntrack.expire()` every
+  `gc_interval` seconds.
+- **`run()`** optionally loads services from `services.json`, starts the
+  reaper, and serves the API until SIGTERM or SIGINT.
+- **Logging** goes through the `logging` module (`sdn.daemon`, `sdn.api`,
+  `sdn.loader`).
+
+### 8.7 CLI ([sdn/cli.py](../sdn/cli.py))
+
+`build_parser()` declares the `argparse` subcommands. Each one is bound to a
+small `cmd_*` function with `set_defaults(func=...)`, and `main()` just calls
+`args.func(args)`. Shared argument groups (attach options, rule fields,
+service fields, timeouts) are defined once and reused. `control_plane.py` in
+the project root is a 10-line shim that calls `sdn.cli.main()`.
 
 ---
 
-## 8. Code walkthrough: `topology.py`
+## 9. Code walkthrough: the testbed (`testbed/`) and test suites
 
-### 8.1 Building the network ([topology.py:134-220](../topology.py:134))
+### 9.1 Addressing and topology ([testbed/config.py](../testbed/config.py), [testbed/net.py](../testbed/net.py))
 
-`build_net(mode)`:
+`config.py` describes every host as a frozen `Host` dataclass (name, IP, MAC,
+gateway port). Derived values such as `gateway_ip`, `intf` and `gw_intf` are
+properties, so the addressing plan lives in one place.
+
+`build_network(gateway_is_switch)`:
 
 1. Creates a `Mininet` object with no controller and no automatic MAC or ARP
    setup.
@@ -769,32 +857,37 @@ formats output; `stats --watch 1` gives a live view.
    with `failMode="secure"` and OpenFlow 1.3 (OVS mode).
 3. Adds 8 hosts with fixed IPs and MACs and a default route, each linked to
    `gw` with predictable interface names.
-4. Disables TX checksum offload on every host interface (§12.3).
-5. Configures the gateway (`setup_router` or `setup_ovs_gateway`).
+4. Disables TX checksum offload on every host interface (§13.3).
 
-`txoff()` uses `ethtool` if present. Otherwise it runs `helper_txoff()`
-([topology.py:63](../topology.py:63)), which makes the same `SIOCETHTOOL`
-ioctl directly from Python.
+`net.py` also has the shell helpers `sh()` (run a command and check its exit
+code), `host_tool()` and `ping_ok()`.
 
-### 8.2 eBPF gateway lifecycle ([topology.py:222-271](../topology.py:222))
+### 9.2 The Gateway interface ([testbed/gateways.py](../testbed/gateways.py))
 
-`EbpfGateway` runs `control_plane.py` **inside the gw namespace** (via
-`gw.cmd`), because interface names and indexes are per-namespace. It loads the
-data plane on `gw-eth0..7`, starts the daemon in the background with short
-timeouts (idle 30 s, FIN 5 s, GC every 2 s), and waits until the REST API
-answers. The tests then drive the control plane **through REST**, the same
-way an orchestrator would.
+`Gateway` is an abstract class with `start`/`stop` and the policy operations
+`block`, `unblock`, `add_service`, `set_backend`, `drop_count` and
+`conntrack`. By default each policy operation raises `Unsupported`, and a
+scenario reports that as SKIP. Implementations override what they can do:
 
-### 8.3 The OVS baseline ([topology.py:185-220](../topology.py:185))
+| Implementation | Forwarding | Firewall | LB | Drain | Drop counter | Conntrack |
+|---|---|---|---|---|---|---|
+| `KernelGateway` | Linux routing (routed access, proxy ARP) | – | – | – | – | – |
+| `EbpfGateway` | `KernelGateway` + eBPF, driven through REST | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `OvsGateway` | OpenFlow 1.3 rules | ✓ | ✓ | – | – | – |
 
-To compare fairly, OVS mode rebuilds the same three functions purely as
-OpenFlow 1.3 rules.
+`EbpfGateway` runs `control_plane.py` **inside the gw namespace**, because
+interface names and indexes are per-namespace. It loads the data plane on
+`gw-eth0..7`, starts the daemon in the background with short timeouts (idle
+30 s, FIN 5 s, GC every 2 s), and waits until the REST API answers. Every
+policy call then goes **through REST**, the same way an orchestrator would.
+
+`OvsGateway` rebuilds the same functions purely as OpenFlow 1.3 rules.
 
 **Table 0 (policy):**
 
 | Priority | Match | Action |
 |---|---|---|
-| 400 | firewall rule, e.g. `ip,nw_src=10.0.1.1,nw_dst=10.0.2.3` | `drop` (added by Test 2) |
+| 400 | ACL from `block()`, e.g. `ip,nw_src=10.0.1.1,nw_dst=10.0.2.3` | `drop` |
 | 300 | `tcp,nw_dst=10.100.0.1,tp_dst=80` | `group:1` (load balancer) |
 | 300 | `tcp,nw_src=10.0.2.X,tp_src=80,nw_dst=10.0.1.0/24` | `set_field:10.100.0.1->ip_src, goto_table:1` (reverse NAT) |
 | 100 | `arp,arp_tpa=<host>` | `output:<host port>` (deliver ARP directly) |
@@ -819,26 +912,52 @@ backend's port 80 to a client is rewritten to the VIP. The eBPF version keeps
 real per-connection state (`lb_reverse`), so it only rewrites replies that
 belong to load-balanced connections.
 
-### 8.4 Tests ([topology.py:291-472](../topology.py:291))
+### 9.3 Scenarios and benchmark ([testbed/scenarios.py](../testbed/scenarios.py), [testbed/benchmark.py](../testbed/benchmark.py))
 
 | Test | Function | How it decides PASS |
 |---|---|---|
-| 1 | `test1_connectivity` | `net.ping()` between all 8 hosts (56 ordered pairs) reports 0% loss |
-| 2 | `test2_firewall` | After `POST /firewall {c1↔s3 drop}`: 3 pings c1→s3 all lost; c1→s2 all succeed; `drop_firewall` rose by ≥3 (proves the *kernel program* dropped them); after `DELETE`, c1→s3 works again |
-| 3 | `test3_loadbalancer` | Each client makes 25 HTTP requests (a new TCP connection each) to the VIP. Every backend's web page returns its own name, so the responses show who served them. PASS needs 0 failures, all 4 backends used, both conntrack tables populated, and, after draining s1, no responses from s1. |
-| 4 | `test4_benchmark` | Measures, then saves JSON (details in §11) |
+| 1 | `test_connectivity` | `net.ping()` between all 8 hosts (56 ordered pairs) reports 0% loss |
+| 2 | `test_firewall` | After `gw.block(c1, s3)`: 3 pings c1→s3 all lost; c1→s2 all succeed; if the gateway has a drop counter, it rose by ≥3 (proves the *data plane* dropped them); after `unblock`, c1→s3 works again |
+| 3 | `test_load_balancer` | Each client makes 25 HTTP requests (a new TCP connection each) to the VIP. Every backend's page returns its own name, so the responses show who served them. PASS needs 0 failures and all 4 backends used. Where supported: conntrack populated, and after draining s1, no responses from s1. |
+| 4 | `benchmark.run` | Composed of small measurement functions (`tcp_throughput`, `udp_small_packets`, `latency`, `lb_rate`, `firewall_drop_rate`), each returning a dict; results are merged and saved as JSON (details in §12) |
 
-Each backend runs `python3 -m http.server` serving a one-line `index.html`
-containing its own name. The servers' PIDs are recorded and killed
-individually at the end. A blanket `pkill` would also kill unrelated
-processes, because Mininet hosts share the host's process table.
+`BackendServers` ([testbed/backends.py](../testbed/backends.py)) runs
+`python3 -m http.server` on each backend and records its PID. At the end it
+kills each server by PID, because a blanket `pkill` would also kill
+unrelated processes: Mininet hosts share the host's process table.
 
-Helper modes (`--http-probe`, `--udp-blast`, `--txoff`) let the same file run
-small tools *inside* Mininet hosts without extra scripts.
+[testbed/hosttools.py](../testbed/hosttools.py) is a standalone script with
+no project imports, so it runs inside any host namespace. It provides three
+commands:
+
+- `txoff` disables checksum offload through the `SIOCETHTOOL` ioctl, for when
+  `ethtool` is missing.
+- `probe` is the HTTP client.
+- `blast` is the UDP flood used for the drop-rate test.
+
+### 9.4 Automated test suites (`tests/`)
+
+| Suite | Needs | What it proves |
+|---|---|---|
+| `test_codec_abi.py` | nothing | Struct sizes match `bpf/abi.h`; byte-order, MAC, protocol and endpoint conversions |
+| `test_dataplane.py` | nothing | Rule validation and key generation, conntrack flushing on drop rules, service id reuse and slot clearing, drain/restore, idle/FIN/hard expiry (with a fixed clock), per-CPU aggregation |
+| `test_api.py` | nothing | The REST API over a real HTTP socket: round trips, 400 on bad input, 404 with the route list |
+| `test_bpf_dataplane.py` | root | Loads the **real kernel programs** and runs crafted packets through them with `BPF_PROG_TEST_RUN`, once per hook (XDP and TC). Checks verdicts, rewritten headers and that every IP/TCP/UDP checksum is still valid after NAT. |
+
+`BPF_PROG_TEST_RUN` is the kernel's built-in way to execute a BPF program on
+a packet buffer and get the verdict and output packet back. It's the closest
+thing to unit-testing the data plane. It caught nothing wrong in the data
+plane, but it now guards every behaviour: firewall patterns, MAC rules, hit
+counters, default-drop with established replies, DNAT/SNAT with valid
+checksums, port translation, stickiness, even spread, draining, the
+no-backend drop, UDP zero checksums, conntrack creation and telemetry.
+[tests/packets.py](../tests/packets.py) is a tiny packet builder and parser
+with its own Internet-checksum implementation, so the tests check the kernel
+against independent arithmetic.
 
 ---
 
-## 9. `benchmark.sh` and the `Makefile`
+## 10. `benchmark.sh` and the `Makefile`
 
 `benchmark.sh` runs `topology.py --test 4` once per configuration, each in a
 freshly built network:
@@ -859,16 +978,19 @@ environment variables.
 
 | Target | Action |
 |---|---|
-| `make` | `clang -O2 -g -Wall -Wextra -target bpf -c xdp_prog.c -o xdp_prog.o` |
-| `make check` | Checks the object has `xdp`, `tc` and `.maps` sections, Python syntax, the ctypes ABI size checks and shell syntax. No root needed. |
-| `sudo make test` / `test-tc` | Tests 1–3 on the XDP / TC hook |
+| `make` | `clang -O2 -g -Wall -Wextra -target bpf -c bpf/xdp_prog.c -o build/xdp_prog.o` (rebuilt when any `bpf/*` file changes) |
+| `make unittest` | The no-root test suites |
+| `make check` | Build + unit tests + checks that both programs are in the object, that all Python compiles, and shell syntax |
+| `make lint` | `ruff` if installed, else `pyflakes` (settings in `pyproject.toml`) |
+| `sudo make test-bpf` | Kernel data-plane tests via `BPF_PROG_TEST_RUN` |
+| `sudo make test` / `test-tc` | Mininet Tests 1–3 on the XDP / TC hook |
 | `sudo make bench` | `./benchmark.sh` |
 | `sudo make clean-net` | `mn -c` and remove pinned maps after an interrupted run |
 | `deps-debian` / `deps-arch` | Install dependencies |
 
 ---
 
-## 10. Test results
+## 11. Test results
 
 These were run on the development machine (Arch Linux, kernel 7.2.5,
 libbpf 1.7, Mininet 2.3.1b4, Open vSwitch 4.0).
@@ -912,6 +1034,33 @@ lb_dnat 751       lb_snat 749 lb_new_conn 125   arp 32
 - **`drop_firewall 3`.** Exactly the three pings sent while the rule was
   active.
 
+### Automated suites
+
+| Command | Result |
+|---|---|
+| `make unittest` (no root) | 33 tests pass: ABI, codec, firewall rules, load balancer, conntrack expiry, telemetry, REST API |
+| `sudo make test-bpf` | 35 kernel tests pass, 1 skipped. Each case runs against both the XDP and the TC program. The skip is the truncated-frame case on TC, where the kernel refuses to build a test `sk_buff` from a frame too short to hold an IPv4 header. |
+| `make lint` | Clean (`pyflakes`) |
+
+### OVS gateway, Tests 1–3
+
+With the testbed's shared `Gateway` interface, the OVS baseline now runs
+Tests 1–3 as well, not just the benchmark:
+
+```
+PASS  T1 pingall (8 hosts, 56 pairs)               0.0% loss
+PASS  T2a c1 -> s3 blocked
+PASS  T2b c1 -> s2 still reachable
+PASS  T2d c1 -> s3 restored after rule removal
+PASS  T3a all requests to VIP answered             100 ok, 0 failed
+PASS  T3b traffic spread over all backends         s1=27, s2=21, s3=23, s4=29
+SKIP  T3c conntrack                                ovs has no connection tracking
+SKIP  T3d backend draining                         ovs cannot drain backends
+```
+
+The SKIPs are the honest difference between the two designs: the
+OpenFlow 1.3 baseline has no connection tracking and no per-backend drain.
+
 ### Connection expiry (GC)
 
 Checked separately. After 10 HTTP requests, `lb_conntrack` and `lb_reverse`
@@ -920,7 +1069,7 @@ held 10 entries each, flagged `SYN,FIN`. Nine seconds later, with
 
 ---
 
-## 11. Benchmark results and how to read them
+## 12. Benchmark results and how to read them
 
 `sudo ./benchmark.sh`, 10-second runs, path c1 → gw → s2 over veth:
 
@@ -1014,9 +1163,9 @@ demonstrates that it works correctly.
 
 ---
 
-## 12. Problems found along the way and how they were fixed
+## 13. Problems found along the way and how they were fixed
 
-### 12.1 First ping lost in `pingall` (proxy-ARP delay)
+### 13.1 First ping lost in `pingall` (proxy-ARP delay)
 
 In the first run, 1 of 56 pairs failed. Linux's proxy ARP waits a **random
 0–800 ms** before answering (`proxy_delay`, meant to let a real host answer
@@ -1024,13 +1173,13 @@ first). Mininet's ping timeout is 1 s, and the first packet also needs two
 ARP resolutions, so occasionally it timed out. Fix: set
 `net.ipv4.neigh.<if>.proxy_delay=0` on the gateway interfaces.
 
-### 12.2 Reverse-path filtering vs. SNAT
+### 13.2 Reverse-path filtering vs. SNAT
 
 After SNAT, a reply's source is the VIP `10.100.0.1`, which the gateway has no
 route for. Strict reverse-path filtering (`rp_filter`) would drop it. Fix:
 `rp_filter=0` on the gateway.
 
-### 12.3 Checksum offload on veth
+### 13.3 Checksum offload on veth
 
 Linux normally leaves TCP/UDP checksum calculation to the network card
 (`CHECKSUM_PARTIAL`). On veth the checksum is never actually finished, and
@@ -1041,13 +1190,13 @@ The TC path doesn't need this, because `bpf_l4_csum_replace(...,
 BPF_F_PSEUDO_HDR)` handles partial checksums correctly. That's one practical
 reason TC exists alongside XDP.
 
-### 12.4 OVS availability check
+### 13.4 OVS availability check
 
 `benchmark.sh` first checked only that the `ovs-vsctl` *command* existed.
 That passed even when the OVS daemon wasn't running. Fix: check
 `ovs-vsctl show`, which only succeeds when the database is reachable.
 
-### 12.5 Installing Mininet on Arch Linux
+### 13.5 Installing Mininet on Arch Linux
 
 | Problem | Cause | Fix |
 |---|---|---|
@@ -1056,15 +1205,34 @@ That passed even when the OVS daemon wasn't running. Fix: check
 | `pacman`: "/usr/bin/mnexec exists in filesystem" | A manually built `mnexec` from a source checkout had been copied there | `pacman -U --overwrite /usr/bin/mnexec ...` |
 | A `mininet/` source checkout inside the project | Leftover from a manual install attempt | Moved to `~/src/mininet` |
 
-### 12.6 Process cleanup in Mininet
+### 13.6 Process cleanup in Mininet
 
 Mininet hosts share the host's process table. `pkill -f http.server` inside a
 host would kill *every* such process on the machine. Fix: record each
 server's PID and kill only those.
 
+### 13.7 Annotations that only worked on Python 3.14
+
+During the restructure, the container's Python 3.13 failed on
+`def flush_matching(self, addr_pairs: list[tuple[int, int]])` inside the
+`ConnTrack` class. Python 3.13 evaluates annotations when the function is
+defined, and inside that class body the name `list` refers to the class's
+own `list()` method, not the built-in. Python 3.14 evaluates annotations
+lazily, which hid the bug. Fix: `from __future__ import annotations` in every
+module, which also keeps the code working on Python 3.8+.
+
+### 13.8 Broken clang after a partial upgrade
+
+Partway through, `clang` stopped starting with "libLLVM.so.23.1: cannot open
+shared object file". `clang` and `llvm` had been upgraded to 23.1, but
+`llvm-libs` was still 22.1. This is the same partial-upgrade problem as the
+Perl mismatch in §13.5, and `pacman -Syu` fixes both. Until then, the BPF
+object can be built in any container that has clang and libbpf.
+
+
 ---
 
-## 13. Limitations and possible extensions
+## 14. Limitations and possible extensions
 
 **Limitations:**
 
@@ -1073,7 +1241,7 @@ server's PID and kill only those.
 - **Firewall rules are matched before NAT.** To restrict access to a service,
   write the rule against the VIP, not the backend.
 - **Fixed wildcard patterns.** The firewall supports the specific wildcard
-  patterns listed in §6.5, not arbitrary masks or CIDR prefixes. Prefix
+  patterns listed in §7.5, not arbitrary masks or CIDR prefixes. Prefix
   matching would need a `BPF_MAP_TYPE_LPM_TRIE`.
 - **Telemetry collisions.** `flow_stats` keeps the newest flow per slot.
   Exact per-connection counters are in the conntrack maps.
@@ -1098,7 +1266,7 @@ server's PID and kill only those.
 
 ---
 
-## 14. Glossary
+## 15. Glossary
 
 | Term | Meaning |
 |---|---|

@@ -1,0 +1,15 @@
+[project]
+name = "sdn-ebpf-dataplane"
+version = "2.0.0"
+description = "eBPF/XDP programmable data plane with a libbpf-based Python control plane"
+requires-python = ">=3.8"
+license = { text = "GPL-2.0" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+extend-exclude = ["build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E731"]  # lambdas in the REST route table are intentional

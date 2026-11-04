@@ -23,16 +23,18 @@ system and the results, see **[docs/GUIDE.md](docs/GUIDE.md)**.
                                       lb_reverse
 ```
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
-| `xdp_prog.c` | Kernel data plane: parser, stateful firewall, L4 load balancer, telemetry, NAT. It has two entry points, `xdp_dataplane` and `tc_dataplane`. |
-| `control_plane.py` | Loader/attacher (libbpf), CLI, REST API, and an idle-timeout GC thread for conntrack |
-| `topology.py` | Mininet testbed with 1 gateway, clients c1–c4 and backends s1–s4, plus Tests 1–4 |
+| `bpf/` | Kernel data plane. `xdp_prog.c` holds the two entry points (`xdp_dataplane`, `tc_dataplane`); each pipeline stage is its own header (`parser.h`, `firewall.h`, `lb.h`, `telemetry.h`, `pipeline.h`, `xdp_nat.h`, `tc_nat.h`), with the shared ABI in `abi.h` and maps in `maps.h`. |
+| `sdn/` | Control plane package: libbpf bindings, map backends, loader, one manager per feature under `dataplane/`, REST API, daemon, CLI |
+| `testbed/` | Mininet testbed: addressing, topology, a `Gateway` interface with eBPF / kernel / OVS implementations, Tests 1–4 |
+| `tests/` | Unit tests (no root) and kernel data-plane tests via `BPF_PROG_TEST_RUN` (root) |
+| `control_plane.py`, `topology.py` | Thin entry points for `sdn` and `testbed` |
 | `benchmark.sh` | Test 4 across eBPF-XDP, eBPF-TC, eBPF-TC+FIB, plain kernel and OVS+OpenFlow |
 | `services.json` | Example service definition for `control_plane.py daemon --services` |
-| `Makefile` | `clang -O2 -target bpf` build, checks, test and bench targets |
+| `Makefile` | Build (`clang -O2 -target bpf` → `build/xdp_prog.o`), tests, lint, bench |
 
-## Data plane design (`xdp_prog.c`)
+## Data plane design (`bpf/`)
 
 **Parser.** Handles Ethernet, an optional 802.1Q/802.1ad tag, ARP (IPv4 over
 Ethernet), IPv4 (including options and fragments), TCP, UDP and ICMP. Every
@@ -94,7 +96,7 @@ one-shot CLI calls and the long-running daemon share the same kernel state.
 Attachments survive after the loader exits.
 
 ```bash
-# load + attach (builds xdp_prog.o if stale); --hook tc for the TC program
+# load + attach (builds build/xdp_prog.o if stale); --hook tc for the TC program
 python3 control_plane.py load -i gw-eth0 -i gw-eth1 [--hook xdp|tc] \
         [--xdp-mode auto|native|generic] [--fib-forward] [--default allow|drop]
 
@@ -201,8 +203,10 @@ Requirements:
 
 ```bash
 sudo make deps-debian          # Debian/Ubuntu (Arch: make deps-arch, Mininet from AUR)
-make                           # clang -O2 -g -target bpf -c xdp_prog.c -o xdp_prog.o
-make check                     # static checks, no root needed
+make                           # clang -O2 -g -target bpf -c bpf/xdp_prog.c -o build/xdp_prog.o
+make check                     # build + unit tests + static checks, no root needed
+make lint                      # ruff, or pyflakes if ruff is missing
+sudo make test-bpf             # kernel data-plane tests (BPF_PROG_TEST_RUN), no Mininet
 sudo make test                 # Tests 1-3, XDP hook
 sudo make test-tc              # Tests 1-3, TC hook
 sudo ./benchmark.sh            # Test 4: ebpf-xdp ebpf-tc ebpf-tc-fib kernel ovs
@@ -220,6 +224,11 @@ Mininet 2.3.1b4, Open vSwitch 4.0):
 
 - Both programs pass the in-kernel verifier.
 - `make test` (XDP) and `make test-tc` (TC) each **pass 9/9**.
+- `make unittest`: 33 control-plane tests pass. `make test-bpf`: 35 kernel
+  tests pass on both hooks, including checks that every checksum is valid
+  after NAT.
+- `--mode ovs` passes Tests 1–3, skipping the two checks OpenFlow 1.3 can't
+  support (conntrack, backend draining).
 - The conntrack GC was checked separately: LB conntrack and reverse entries
   with FIN set were expired after `--fin-timeout`.
 
