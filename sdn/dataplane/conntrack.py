@@ -58,33 +58,60 @@ class ConnTrack:
             return sum(m.delete(k) for m in (self._fw, self._lb, self._rev) for k in m.keys())
 
     def flush_matching(self, addr_pairs: list[tuple[int, int]]) -> int:
-        """Delete entries whose (saddr, daddr) match any pair; 0 is a wildcard."""
+        """Delete entries whose client-visible (saddr, daddr) match any pair; 0 is
+        a wildcard. Reverse-NAT entries are judged by the VIP they stand for."""
         if not addr_pairs:
             return 0
+
+        def hit(s_addr: int, d_addr: int) -> bool:
+            return any(s in (0, s_addr) and d in (0, d_addr) for s, d in addr_pairs)
+
         n = 0
         with self._lock:
-            for m in (self._fw, self._lb, self._rev):
-                for k in m.keys():
-                    if any(s in (0, k.saddr) and d in (0, k.daddr) for s, d in addr_pairs):
-                        n += m.delete(k)
+            for m in (self._fw, self._lb):
+                n += sum(m.delete(k) for k in m.keys() if hit(k.saddr, k.daddr))
+            for k, v in self._rev.items():
+                if hit(v.vip, k.daddr) or hit(k.daddr, v.vip):
+                    n += self._rev.delete(k)
         return n
 
+    @staticmethod
+    def _reply_key(fwd: FlowKey, v) -> FlowKey:
+        return FlowKey(saddr=v.backend_ip, daddr=fwd.saddr, sport=v.backend_port,
+                       dport=fwd.sport, proto=fwd.proto, l3=L3.IPV4)
+
+    @staticmethod
+    def _delete_if_expired(m: MapBackend, key, still_expired) -> int:
+        """Re-read the entry right before deleting it: the data plane may have
+        refreshed it since this pass read it. bpf() offers no compare-and-delete,
+        so a microsecond window remains (see the paper, Section IV-E)."""
+        current = m.lookup(key)
+        return int(current is not None and still_expired(current) and m.delete(key))
+
     def expire(self, timeouts: Timeouts, now_ns: int | None = None) -> dict[str, int]:
-        """One garbage-collection pass. Returns the number removed per table."""
+        """One garbage-collection pass. Returns the number removed per table.
+
+        The data plane refreshes a load-balanced connection's forward and
+        reverse entries from both directions, so the pair shares one liveness.
+        """
         now = monotonic_ns() if now_ns is None else now_ns
         removed = dict.fromkeys(CONNTRACK_MAPS, 0)
+
+        def fw_dead(v) -> bool:
+            return timeouts.expired(now, v.last_seen_ns, v.flags, v.created_ns)
+
+        def rev_dead(v) -> bool:
+            return timeouts.expired(now, v.last_seen_ns, v.flags)
+
         with self._lock:
             for k, v in self._fw.items():
-                if timeouts.expired(now, v.last_seen_ns, v.flags, v.created_ns):
-                    removed["fw_conntrack"] += self._fw.delete(k)
+                if fw_dead(v):
+                    removed["fw_conntrack"] += self._delete_if_expired(self._fw, k, fw_dead)
             for k, v in self._lb.items():
-                if timeouts.expired(now, v.last_seen_ns, v.flags, v.created_ns):
-                    removed["lb_conntrack"] += self._lb.delete(k)
-                    # the reverse-NAT entry goes with its forward entry
-                    removed["lb_reverse"] += self._rev.delete(FlowKey(
-                        saddr=v.backend_ip, daddr=k.saddr, sport=v.backend_port,
-                        dport=k.sport, proto=k.proto, l3=L3.IPV4))
-            for k, v in self._rev.items():
-                if timeouts.expired(now, v.last_seen_ns, v.flags):
-                    removed["lb_reverse"] += self._rev.delete(k)
+                if fw_dead(v) and self._delete_if_expired(self._lb, k, fw_dead):
+                    removed["lb_conntrack"] += 1
+                    removed["lb_reverse"] += self._rev.delete(self._reply_key(k, v))
+            for k, v in self._rev.items():  # orphans whose forward entry is gone
+                if rev_dead(v):
+                    removed["lb_reverse"] += self._delete_if_expired(self._rev, k, rev_dead)
         return removed

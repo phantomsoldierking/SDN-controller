@@ -13,11 +13,11 @@
 /* ------------------------------------------------------------------ */
 /* Sizing                                                              */
 /* ------------------------------------------------------------------ */
-#define MAX_FW_RULES 4096
+#define MAX_FW_RULES 16384
 #define MAX_CT_ENTRIES 65536
 #define MAX_SERVICES 16
 #define MAX_BACKENDS_PER_SVC 16
-#define FLOW_SLOTS 1024 /* power of two */
+#define FLOW_TABLE_SIZE 16384 /* per-flow telemetry entries (LRU) */
 
 /* ------------------------------------------------------------------ */
 /* Shared ABI with control_plane.py (keep in sync, no implicit padding) */
@@ -25,6 +25,24 @@
 enum fw_kind {
 	FW_KIND_IP = 1,  /* 5-tuple (with structured wildcards, see fw_lookup) */
 	FW_KIND_MAC = 2, /* 2-tuple (src MAC, dst MAC), dst MAC may be wildcard */
+};
+
+/*
+ * Rule patterns, in lookup order (most specific first). The mask id is part
+ * of the key, so a zero field is never confused with a wildcard (e.g. a
+ * packet with port 0 or protocol 0 cannot match a wildcarded rule).
+ */
+enum fw_mask {
+	FW_M_MAC_PAIR = 1,  /* (smac, dmac)                     */
+	FW_M_MAC_SRC = 2,   /* (smac, *)                        */
+	FW_M_IP_EXACT = 3,  /* (s, d, sport, dport, proto)      TCP/UDP */
+	FW_M_IP_DPORT = 4,  /* (s, d, *,     dport, proto)      TCP/UDP */
+	FW_M_IP_SPORT = 5,  /* (s, d, sport, *,     proto)      TCP/UDP */
+	FW_M_IP_PROTO = 6,  /* (s, d, *,     *,     proto)      */
+	FW_M_IP_PAIR = 7,   /* (s, d, *,     *,     *)          */
+	FW_M_SVC_PORT = 8,  /* (*, d, *,     dport, proto)      TCP/UDP */
+	FW_M_IP_SRC = 9,    /* (s, *, *,     *,     *)          */
+	FW_M_IP_DST = 10,   /* (*, d, *,     *,     *)          */
 };
 
 enum fw_action {
@@ -55,7 +73,8 @@ struct fw_key {
 	__u8 proto;
 	__u16 sport;
 	__u16 dport;
-	__u16 pad;
+	__u8 mask; /* enum fw_mask: which fields are significant */
+	__u8 pad;
 	__u32 saddr;
 	__u32 daddr;
 	__u8 smac[ETH_ALEN];
@@ -126,9 +145,8 @@ struct lb_rev {
 	__u32 pad2;
 };
 
-/* flow_stats value (per-CPU, slot = hash(flow) % FLOW_SLOTS) */
+/* flow_stats value (per-CPU LRU hash keyed by flow_key; admitted traffic only) */
 struct flow_stat {
-	struct flow_key key;
 	__u64 packets;
 	__u64 bytes;
 	__u64 last_seen_ns;

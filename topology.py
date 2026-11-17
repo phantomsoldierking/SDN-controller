@@ -9,8 +9,10 @@ topology.py - Mininet testbed for the eBPF/XDP SDN data plane.
 
 Modes
   ebpf    Linux router + xdp_prog (XDP by default, --hook tc for TC)
-  kernel  Linux router without eBPF (baseline)
-  ovs     Open vSwitch acting as the gateway through OpenFlow 1.3 rules
+  kernel    Linux router without eBPF (baseline, no policy)
+  nft-ipvs  Linux router + nftables (stateful firewall) + IPVS (L4 load balancer)
+  ovs       Open vSwitch acting as the gateway through stateless OpenFlow 1.3 rules
+  ovs-ct    Open vSwitch with connection tracking and NAT (ct/nat actions)
 
 Tests
   1  ICMP pingall between all 8 hosts
@@ -44,7 +46,8 @@ from testbed.report import Report  # noqa: E402
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["ebpf", "kernel", "ovs"], default="ebpf")
+    ap.add_argument("--mode", choices=["ebpf", "kernel", "nft-ipvs", "ovs", "ovs-ct"],
+                    default="ebpf")
     ap.add_argument("--hook", choices=["xdp", "tc"], default="xdp")
     ap.add_argument("--xdp-mode", choices=["auto", "native", "generic"], default="auto")
     ap.add_argument("--fib-forward", action="store_true",
@@ -53,6 +56,7 @@ def parse_args():
     ap.add_argument("--requests", type=int, default=25, help="HTTP requests per client")
     ap.add_argument("--duration", type=int, default=10, help="iperf3 seconds")
     ap.add_argument("--bench-out", help="write Test 4 JSON here")
+    ap.add_argument("--report-out", help="write the PASS/FAIL report of Tests 1-3 as JSON here")
     ap.add_argument("--cli", action="store_true", help="drop into the Mininet CLI afterwards")
     a = ap.parse_args()
     a.tests = ({"1", "2", "3", "4"} if a.test == "all"
@@ -88,7 +92,7 @@ def main() -> int:
     setLogLevel("warning")
 
     workdir = tempfile.mkdtemp(prefix="sdn_ebpf_")
-    net = build_network(gateway_is_switch=a.mode == "ovs")
+    net = build_network(gateway_is_switch=a.mode.startswith("ovs"))
     gw = make_gateway(net, a.mode, a.hook, a.xdp_mode, a.fib_forward, workdir)
     print(f"*** Topology up (mode={gw.label})")
     backends = BackendServers(net, os.path.join(workdir, "www"))
@@ -99,6 +103,9 @@ def main() -> int:
         run(a, net, gw, report, workdir)
         if a.tests:
             report.print_summary()
+        if a.report_out:
+            os.makedirs(os.path.dirname(os.path.abspath(a.report_out)), exist_ok=True)
+            report.save(a.report_out, gw.label)
         if a.cli:
             print("*** Mininet CLI. Try:  gw python3 control_plane.py stats")
             CLI(net)

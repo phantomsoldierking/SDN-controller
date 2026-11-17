@@ -1,7 +1,8 @@
 """PASS / FAIL / SKIP bookkeeping for the testbed scenarios."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
 
 
 @dataclass
@@ -18,6 +19,7 @@ class Check:
 @dataclass
 class Report:
     checks: list[Check] = field(default_factory=list)
+    data: dict = field(default_factory=dict)  # measurements behind the checks
 
     def add(self, name: str, ok: bool | None, detail: str = "") -> None:
         check = Check(name, ok, detail)
@@ -30,6 +32,12 @@ class Report:
     @property
     def passed(self) -> bool:
         return all(c.ok is not False for c in self.checks)
+
+    def save(self, path: str, label: str) -> None:
+        with open(path, "w") as f:
+            json.dump({"mode": label, "passed": self.passed,
+                       "checks": [{**asdict(c), "result": c.tag} for c in self.checks],
+                       "data": self.data}, f, indent=2)
 
     def print_summary(self) -> None:
         print("\n" + "=" * 72)

@@ -1,0 +1,20 @@
+{
+  "mode": "nft-ipvs",
+  "duration_s": 10,
+  "client_cpu": "0",
+  "server_cpu": "2",
+  "tcp_gbps": 9.778,
+  "udp64_rx_pps": 512534,
+  "udp64_loss_pct": 0.38,
+  "rtt_min_ms": 0.001,
+  "rtt_avg_ms": 0.002,
+  "rtt_max_ms": 0.031,
+  "rtt_mdev_ms": 0.002,
+  "lb_rps": 1435.4,
+  "lb_avg_ms": 0.696,
+  "lb_fail": 0,
+  "fw_drop_pps": 763438,
+  "fw_drop_sent": 2290432,
+  "fw_dropped": 2290432,
+  "fw_drop_seconds": 3.000154
+}

@@ -7,15 +7,14 @@ entry point.
 """
 from __future__ import annotations
 
-import ctypes as ct
 import os
 import shutil
 import unittest
 
+from sdn.codec import flow_key
 from sdn.dataplane import DataPlane, FirewallRule
-from sdn.libbpf import BpfError, TestRunOpts, get_libbpf
 from sdn.loader import LoadedObject, build, unpin_maps
-from tests import packets as P
+from testbed import packets as P
 
 C1, C2, S1, S2, S3, VIP = "10.0.1.1", "10.0.1.2", "10.0.2.1", "10.0.2.2", "10.0.2.3", "10.100.0.1"
 BACKENDS = [S1, S2, S3, "10.0.2.4"]
@@ -43,7 +42,6 @@ class _DataPlaneCases:
         build()
         cls.obj = LoadedObject(cls.HOOK, pin_dir=cls.pin_dir)
         cls.dp = DataPlane.open(cls.pin_dir)
-        cls.lib = get_libbpf()
 
     @classmethod
     def tearDownClass(cls):
@@ -61,15 +59,8 @@ class _DataPlaneCases:
 
     # ---- helpers ----
     def run_packet(self, frame: bytes) -> tuple[int, bytes]:
-        out = ct.create_string_buffer(len(frame) + 256)
-        inp = ct.create_string_buffer(frame, len(frame))
-        opts = TestRunOpts(sz=ct.sizeof(TestRunOpts), data_in=ct.cast(inp, ct.c_void_p),
-                           data_out=ct.cast(out, ct.c_void_p), data_size_in=len(frame),
-                           data_size_out=len(out), repeat=1)
-        rc = self.lib.bpf_prog_test_run_opts(self.obj.prog_fd, ct.byref(opts))
-        if rc < 0:
-            raise BpfError(f"BPF_PROG_TEST_RUN failed: {os.strerror(-rc)}")
-        return opts.retval, out.raw[:opts.data_size_out]
+        verdict, out, _ = self.obj.test_run(frame)
+        return verdict, out
 
     def counter(self, name: str) -> int:
         return self.dp.telemetry.counters()[name]
@@ -78,8 +69,15 @@ class _DataPlaneCases:
         self.assertTrue(pkt.ip_csum_ok, "IPv4 header checksum broken")
         self.assertTrue(pkt.l4_csum_ok, "L4 checksum broken")
 
-    def add_service(self, proto="tcp", port=80):
-        self.dp.lb.add_service(VIP, port, BACKENDS, proto)
+    def add_service(self, proto="tcp", port=80, backends=BACKENDS):
+        self.dp.lb.add_service(VIP, port, backends, proto)
+
+    def backend_for(self, client_port: int, flags=0x02) -> str:
+        """Send client -> VIP and return the backend it was rewritten to."""
+        return P.parse(self.run_packet(P.build(C1, VIP, client_port, 80, tcp_flags=flags))[1]).dst_ip
+
+    def lb_entry(self, client_port: int):
+        return self.dp.maps["lb_conntrack"].lookup(flow_key(C1, VIP, client_port, 80, 6))
 
     # ---- parser / pass-through ----
     def test_plain_traffic_passes_unmodified(self):
@@ -214,7 +212,92 @@ class _DataPlaneCases:
         self.assertEqual([(e["dst"], e["dport"]) for e in tables["lb_reverse"]], [(C1, 40006)])
         self.assertEqual(tables["lb"][0]["flags"], "SYN")
 
+    # ---- connection lifecycle (review round 1) ----
+    def test_existing_connection_survives_drain(self):
+        """Draining stops new connections only; established ones keep their backend."""
+        self.add_service()
+        backend = self.backend_for(41000)
+        self.dp.lb.set_backend_state(VIP, 80, backend, up=False)
+        for _ in range(3):
+            self.assertEqual(self.backend_for(41000, flags=0x10), backend)
+        self.assertNotEqual(self.backend_for(41001), backend, "new connections avoid it")
+
+    def test_replaced_backend_reassigns_and_removes_stale_reverse_entry(self):
+        self.add_service(backends=[S1])
+        self.assertEqual(self.backend_for(41010), S1)
+        self.dp.lb.add_service(VIP, 80, [S2])          # S1 removed from the pool
+        self.assertEqual(self.backend_for(41010, flags=0x10), S2)
+        rev = self.dp.maps["lb_reverse"]
+        self.assertIsNone(rev.lookup(flow_key(S1, C1, 80, 41010, 6)), "stale entry removed")
+        self.assertIsNotNone(rev.lookup(flow_key(S2, C1, 80, 41010, 6)))
+
+    def test_reply_refreshes_forward_entry_and_records_server_fin(self):
+        self.add_service()
+        backend = self.backend_for(41020)
+        before = self.lb_entry(41020).last_seen_ns
+        self.run_packet(P.build(backend, C1, 80, 41020, tcp_flags=0x11))  # FIN,ACK from server
+        entry = self.lb_entry(41020)
+        self.assertGreater(entry.last_seen_ns, before)
+        self.assertTrue(entry.flags & 0x2, "server FIN shortens the forward entry's timeout")
+
+    def test_evicted_reverse_entry_is_recreated(self):
+        self.add_service()
+        backend = self.backend_for(41030)
+        rk = flow_key(backend, C1, 80, 41030, 6)
+        self.dp.maps["lb_reverse"].delete(rk)            # as if the LRU evicted it
+        self.backend_for(41030, flags=0x10)
+        self.assertIsNotNone(self.dp.maps["lb_reverse"].lookup(rk))
+
+    # ---- firewall semantics (review round 1) ----
+    def test_service_port_rule_allows_any_client(self):
+        self.add_service()
+        self.dp.config.apply(default_action="drop")
+        self.dp.firewall.add(FirewallRule(dst=VIP, proto="tcp", dport=80, action="allow"))
+        for client in (C1, C2):
+            self.assertEqual(self.run_packet(P.build(client, VIP, 42000, 80))[0], self.PASS)
+        self.assertEqual(self.run_packet(P.build(C1, VIP, 42000, 81))[0], self.DROP)
+
+    def test_no_pinhole_to_backend_after_load_balanced_connection(self):
+        """Under default drop, a VIP connection must not open direct access to the backend."""
+        self.add_service()
+        self.dp.config.apply(default_action="drop")
+        self.dp.firewall.add(FirewallRule(dst=VIP, proto="tcp", dport=80, action="allow"))
+        backend = self.backend_for(42010)
+        verdict, out = self.run_packet(P.build(backend, C1, 80, 42010, tcp_flags=0x12))
+        self.assertEqual(verdict, self.PASS, "reply of the VIP connection is established")
+        self.assertEqual(P.parse(out).src_ip, VIP)
+        self.assertEqual(self.run_packet(P.build(C1, backend, 42010, 80, tcp_flags=0x10))[0],
+                         self.DROP, "direct client -> backend traffic stays blocked")
+
+    def test_rules_see_the_client_view_of_load_balanced_replies(self):
+        self.add_service(backends=[S3])
+        # a client<->backend rule does not affect VIP traffic in either direction ...
+        self.dp.firewall.add(FirewallRule(src=C1, dst=S3, bidir=True))
+        self.assertEqual(self.backend_for(42020), S3)
+        self.assertEqual(self.run_packet(P.build(S3, C1, 80, 42020, tcp_flags=0x12))[0], self.PASS)
+        # ... while a rule against the VIP blocks its replies too
+        self.dp.firewall.add(FirewallRule(src=VIP, dst=C1))
+        self.assertEqual(self.run_packet(P.build(S3, C1, 80, 42020, tcp_flags=0x10))[0], self.DROP)
+
+    def test_mac_rule_applies_to_non_ip_frames(self):
+        self.dp.firewall.add(FirewallRule(src_mac="00:00:00:00:01:01"))
+        ipv6 = P.mac("00:00:00:00:00:fe") + P.mac("00:00:00:00:01:01") + b"\x86\xdd" + bytes(40)
+        self.assertEqual(self.run_packet(ipv6)[0], self.DROP)
+
+    def test_reply_does_not_duplicate_firewall_state(self):
+        self.run_packet(P.build(C1, S2, 42030, 22))
+        self.run_packet(P.build(S2, C1, 22, 42030, tcp_flags=0x12))
+        entries = [e for e in self.dp.conntrack.list()["firewall"]
+                   if {e["sport"], e["dport"]} == {42030, 22}]
+        self.assertEqual(len(entries), 1)
+        self.assertIn("REPLY", entries[0]["flags"])
+
     # ---- telemetry ----
+    def test_dropped_packets_are_not_in_flow_telemetry(self):
+        self.dp.firewall.add(FirewallRule(src=C2, dst=S3))
+        self.run_packet(P.build(C2, S3, 45999, 443))
+        self.assertFalse([f for f in self.dp.telemetry.top_flows(10000) if f.get("sport") == 45999])
+
     def test_flow_telemetry(self):
         frame = P.build(C2, S1, 45000, 443)
         for _ in range(4):

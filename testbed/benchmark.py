@@ -1,6 +1,7 @@
 """Test 4: performance benchmark on the c1 -> gw -> s2 path."""
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -16,8 +17,39 @@ from .report import Report
 DROP_TEST_PORT = 9999
 
 
+def _pick_cpus() -> tuple[str, str]:
+    """Client and server CPUs for the traffic tools: SDN_CLIENT_CPU / SDN_SERVER_CPU,
+    else the first hardware thread of the two fastest physical cores (on hybrid
+    CPUs these are performance cores). Empty strings disable pinning."""
+    env = os.environ.get("SDN_CLIENT_CPU"), os.environ.get("SDN_SERVER_CPU")
+    if all(env):
+        return env
+    cores: dict[tuple[int, int], tuple[int, int]] = {}
+    for cpu_dir in glob.glob("/sys/devices/system/cpu/cpu[0-9]*"):
+        cpu = int(cpu_dir.rsplit("cpu", 1)[1])
+        try:
+            freq = int(open(f"{cpu_dir}/cpufreq/cpuinfo_max_freq").read())
+            core = (int(open(f"{cpu_dir}/topology/physical_package_id").read()),
+                    int(open(f"{cpu_dir}/topology/core_id").read()))
+        except (OSError, ValueError):
+            continue
+        if core not in cores or cpu < cores[core][1]:
+            cores[core] = (freq, cpu)
+    fastest = sorted(cores.values(), key=lambda fc: (-fc[0], fc[1]))
+    if len(fastest) < 2:
+        return "", ""
+    return str(fastest[0][1]), str(fastest[1][1])
+
+
+CLIENT_CPU, SERVER_CPU = _pick_cpus()
+
+
+def pinned(cpu: str, cmd: str) -> str:
+    return f"taskset -c {cpu} {cmd}" if cpu and shutil.which("taskset") else cmd
+
+
 def _iperf(node, args: str) -> dict:
-    out = node.cmd(f"iperf3 {args} -J")
+    out = node.cmd(pinned(CLIENT_CPU, f"iperf3 {args} -J"))
     try:
         return json.loads(out)
     except json.JSONDecodeError:
@@ -40,7 +72,7 @@ def udp_small_packets(client, server_ip: str, duration: int) -> dict:
 
 
 def latency(client, server_ip: str) -> dict:
-    out = client.cmd(f"ping -c 500 -i 0.002 -q {server_ip}")
+    out = client.cmd(pinned(CLIENT_CPU, f"ping -c 500 -i 0.002 -q {server_ip}"))
     m = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms", out)
     if not m:
         return {}
@@ -54,17 +86,20 @@ def lb_rate(client, requests: int) -> dict:
 
 
 def firewall_drop_rate(gw: Gateway, client, src_ip: str, dst_ip: str) -> dict:
-    """Flood a blocked UDP port and count drops in the data plane."""
+    """Flood a blocked UDP port and count drops in the data plane.
+
+    The single-threaded Python sender is the bottleneck, so this is a lower
+    bound (sender-limited); the in-kernel drop cost is measured separately by
+    testbed/microbench.py. The rate uses the sender's own measured duration."""
     gw.block(src_ip, dst_ip, proto="udp", dport=DROP_TEST_PORT, bidir=False)
     try:
         before = gw.drop_count()
-        start = time.perf_counter()
-        sent = host_tool(client, "blast", dst_ip, DROP_TEST_PORT, 3)["sent"]
-        elapsed = time.perf_counter() - start
+        blast = host_tool(client, "blast", dst_ip, DROP_TEST_PORT, 3)
         dropped = gw.drop_count() - before
     finally:
         gw.unblock(src_ip, dst_ip, proto="udp", dport=DROP_TEST_PORT, bidir=False)
-    return {"fw_drop_pps": int(dropped / elapsed), "fw_drop_sent": sent, "fw_dropped": dropped}
+    return {"fw_drop_pps": int(dropped / blast["seconds"]), "fw_drop_sent": blast["sent"],
+            "fw_dropped": dropped, "fw_drop_seconds": blast["seconds"]}
 
 
 def run(net, gw: Gateway, report: Report, duration: int, requests: int, out_path: str | None,
@@ -76,10 +111,11 @@ def run(net, gw: Gateway, report: Report, duration: int, requests: int, out_path
     c1, s2, s3 = host("c1"), host("s2"), host("s3")
     client, server = net.get(c1.name), net.get(s2.name)
     pidfile = os.path.join(workdir, "iperf3_s2.pid")
-    server.cmd(f"iperf3 -s -D --pidfile {pidfile}")
+    server.cmd(pinned(SERVER_CPU, f"iperf3 -s -D --pidfile {pidfile}"))
     time.sleep(0.5)
 
-    result = {"mode": gw.label, "duration_s": duration}
+    result = {"mode": gw.label, "duration_s": duration, "client_cpu": CLIENT_CPU,
+              "server_cpu": SERVER_CPU}
     try:
         result.update(tcp_throughput(client, s2.ip, duration))
         result.update(udp_small_packets(client, s2.ip, duration))

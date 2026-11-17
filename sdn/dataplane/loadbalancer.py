@@ -34,6 +34,7 @@ class LoadBalancer:
         endpoints = [parse_endpoint(b, port) for b in backends]
         key = _service_key(vip, port, proto)
         with self._lock:
+            self._check_disjoint(key, endpoints, parse_proto(proto))
             existing = self._services.lookup(key)
             svc_id = existing.id if existing is not None else self._free_id()
             for i in range(MAX_BACKENDS_PER_SVC):
@@ -45,6 +46,22 @@ class LoadBalancer:
                 self._backends.update(_slot(svc_id, i), be)
             self._services.update(key, SvcInfo(id=svc_id, count=len(endpoints)))
         return svc_id
+
+    def _check_disjoint(self, key: SvcKey, endpoints: list[tuple[str, int]], proto: int) -> None:
+        """Reverse-NAT entries are keyed by the backend's reply 5-tuple, which does
+        not contain the VIP. Two services sharing a backend endpoint could
+        therefore produce the same reverse key, so endpoints must be disjoint."""
+        wanted = {(ip_to_wire(ip), port_to_wire(p)) for ip, p in endpoints}
+        for other_key, info in self._services.items():
+            if bytes(other_key) == bytes(key) or other_key.proto != proto:
+                continue
+            for i in range(info.count):
+                be = self._backends.lookup(_slot(info.id, i))
+                if be is not None and (be.ip, be.port) in wanted:
+                    raise ValueError(
+                        f"backend {wire_to_ip(be.ip)}:{wire_to_port(be.port)} already serves "
+                        f"{wire_to_ip(other_key.vip)}:{wire_to_port(other_key.port)}; "
+                        "backend endpoints must be disjoint across services")
 
     def _free_id(self) -> int:
         used = {info.id for _, info in self._services.items()}
@@ -66,7 +83,9 @@ class LoadBalancer:
 
     def set_backend_state(self, vip: str, port: int, backend: str, up: bool,
                           proto: str = "tcp") -> bool:
-        """Drain (up=False) or restore a backend. Returns False if it is not in the pool."""
+        """Drain (up=False) or restore a backend. A drained backend receives no new
+        connections; its existing connections continue until they close or expire.
+        Returns False if the backend is not in the pool."""
         info = self._services.lookup(_service_key(vip, port, proto))
         if info is None:
             raise ValueError(f"no service {vip}:{port}/{proto}")

@@ -17,6 +17,20 @@ class FwKind(IntEnum):
     MAC = 2
 
 
+class FwMask(IntEnum):
+    """Rule patterns in lookup order (enum fw_mask in bpf/abi.h)."""
+    MAC_PAIR = 1   # (smac, dmac)
+    MAC_SRC = 2    # (smac, *)
+    IP_EXACT = 3   # (s, d, sport, dport, proto)
+    IP_DPORT = 4   # (s, d, *, dport, proto)
+    IP_SPORT = 5   # (s, d, sport, *, proto)
+    IP_PROTO = 6   # (s, d, *, *, proto)
+    IP_PAIR = 7    # (s, d, *, *, *)
+    SVC_PORT = 8   # (*, d, *, dport, proto)
+    IP_SRC = 9     # (s, *, *, *, *)
+    IP_DST = 10    # (*, d, *, *, *)
+
+
 class Action(IntEnum):
     NONE = 0
     ALLOW = 1
@@ -63,7 +77,8 @@ class FlowKey(ct.Structure):
 
 class FwKey(ct.Structure):
     _fields_ = [("kind", ct.c_uint8), ("proto", ct.c_uint8),
-                ("sport", ct.c_uint16), ("dport", ct.c_uint16), ("pad", ct.c_uint16),
+                ("sport", ct.c_uint16), ("dport", ct.c_uint16),
+                ("mask", ct.c_uint8), ("pad", ct.c_uint8),
                 ("saddr", ct.c_uint32), ("daddr", ct.c_uint32),
                 ("smac", ct.c_uint8 * 6), ("dmac", ct.c_uint8 * 6)]
 
@@ -105,8 +120,8 @@ class LbRev(ct.Structure):
 
 
 class FlowStat(ct.Structure):
-    _fields_ = [("key", FlowKey), ("packets", ct.c_uint64),
-                ("bytes", ct.c_uint64), ("last_seen_ns", ct.c_uint64)]
+    _fields_ = [("packets", ct.c_uint64), ("bytes", ct.c_uint64),
+                ("last_seen_ns", ct.c_uint64)]
 
 
 class DpConfig(ct.Structure):
@@ -128,7 +143,7 @@ MAP_SPECS = {
     "lb_backends": MapSpec(ct.c_uint32, Backend),
     "lb_conntrack": MapSpec(FlowKey, LbCt),
     "lb_reverse": MapSpec(FlowKey, LbRev),
-    "flow_stats": MapSpec(ct.c_uint32, FlowStat, percpu=True),
+    "flow_stats": MapSpec(FlowKey, FlowStat, percpu=True),
     "global_stats": MapSpec(ct.c_uint32, ct.c_uint64, percpu=True),
     "dp_config_map": MapSpec(ct.c_uint32, DpConfig),
 }
@@ -136,7 +151,7 @@ MAP_SPECS = {
 CONNTRACK_MAPS = ("fw_conntrack", "lb_conntrack", "lb_reverse")
 
 _EXPECTED_SIZES = {FlowKey: 16, FwKey: 28, FwRule: 16, CtEntry: 40, SvcKey: 8, SvcInfo: 8,
-                   Backend: 8, LbCt: 48, LbRev: 24, FlowStat: 40, DpConfig: 8}
+                   Backend: 8, LbCt: 48, LbRev: 24, FlowStat: 24, DpConfig: 8}
 for _struct, _size in _EXPECTED_SIZES.items():
     if ct.sizeof(_struct) != _size:
         raise ImportError(f"ABI mismatch: sizeof({_struct.__name__}) = {ct.sizeof(_struct)}, "

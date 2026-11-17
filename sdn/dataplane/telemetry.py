@@ -1,10 +1,10 @@
 """Telemetry readers (global_stats, flow_stats). Both maps are per-CPU:
-every CPU has its own copy, which is summed / merged here."""
+every CPU has its own copy, which is summed here."""
 from __future__ import annotations
 
 import ctypes as ct
 
-from ..abi import STAT_NAMES, FlowKey
+from ..abi import STAT_NAMES
 from ..codec import flow_key_to_dict, idle_seconds, monotonic_ns
 from ..maps import MapBackend
 
@@ -21,17 +21,15 @@ class Telemetry:
         return out
 
     def top_flows(self, top: int = 20) -> list[dict]:
-        merged: dict[bytes, dict] = {}
-        for _, per_cpu in self._flows.items():
-            for fs in per_cpu:
-                if not fs.packets:
-                    continue
-                key = bytes(fs.key)
-                agg = merged.setdefault(key, {"packets": 0, "bytes": 0, "last": 0})
-                agg["packets"] += fs.packets
-                agg["bytes"] += fs.bytes
-                agg["last"] = max(agg["last"], fs.last_seen_ns)
+        """Flows ranked by bytes. flow_stats is a per-CPU hash keyed by the flow,
+        so each key's per-CPU values are simply summed."""
+        rows = []
+        for key, per_cpu in self._flows.items():
+            packets = sum(fs.packets for fs in per_cpu)
+            if packets:
+                rows.append((key, packets, sum(fs.bytes for fs in per_cpu),
+                             max(fs.last_seen_ns for fs in per_cpu)))
         now = monotonic_ns()
-        rows = sorted(merged.items(), key=lambda kv: kv[1]["bytes"], reverse=True)[:top]
-        return [{**flow_key_to_dict(FlowKey.from_buffer_copy(k)), "packets": a["packets"],
-                 "bytes": a["bytes"], "idle_s": idle_seconds(a["last"], now)} for k, a in rows]
+        rows.sort(key=lambda r: r[2], reverse=True)
+        return [{**flow_key_to_dict(k), "packets": pk, "bytes": by,
+                 "idle_s": idle_seconds(last, now)} for k, pk, by, last in rows[:top]]

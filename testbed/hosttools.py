@@ -55,7 +55,8 @@ def probe(url: str, n: int, timeout: float = 2.0) -> dict:
 def blast(dst: str, port: int, seconds: float, frame_size: int = 64) -> dict:
     payload = b"x" * (frame_size - 42)  # 14 Ethernet + 20 IPv4 + 8 UDP
     sent = 0
-    end = time.perf_counter() + seconds
+    start = time.perf_counter()
+    end = start + seconds
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         while time.perf_counter() < end:
             for _ in range(256):
@@ -64,7 +65,8 @@ def blast(dst: str, port: int, seconds: float, frame_size: int = 64) -> dict:
                     sent += 1
                 except OSError:
                     pass
-    return {"sent": sent, "seconds": seconds}
+    # measured by the sender itself, so process start-up is not included
+    return {"sent": sent, "seconds": round(time.perf_counter() - start, 6)}
 
 
 def main() -> int:

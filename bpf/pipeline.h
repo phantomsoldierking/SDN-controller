@@ -13,6 +13,16 @@
 /* ------------------------------------------------------------------ */
 /* Hook-independent pipeline                                           */
 /* ------------------------------------------------------------------ */
+/*
+ * Order (Algorithm 1 of the paper):
+ *   parse -> L2 rules (all frames) -> [IPv4] client-visible key -> L3/L4 rules
+ *   + stateful admission -> load balancer -> conntrack update -> telemetry.
+ *
+ * The firewall judges load-balanced replies by the flow the client sees
+ * (VIP -> client), not by the backend's real address: rules written against
+ * the VIP apply in both directions, and a reply never creates firewall state
+ * for the backend's address.
+ */
 static __always_inline int pipeline(void *data, void *data_end, struct pkt *p,
 				    struct verdict *v, struct dp_config **cfg_out)
 {
@@ -31,25 +41,44 @@ static __always_inline int pipeline(void *data, void *data_end, struct pkt *p,
 		v->drop = 1;
 		return 0;
 	}
-	if (rc == PARSE_NON_IP) {
-		stat_add(STAT_NON_IP, 1);
-		return 0;
-	}
-	if (p->key.l3 == L3_ARP)
-		stat_add(STAT_ARP, 1);
-
-	telemetry(p, now);
-
-	if (firewall(p, cfg, now)) {
+	/* L2 rules apply to every frame, including IPv6 and other non-IP traffic. */
+	if (fw_mac_lookup(p->eth) == ACT_DROP) {
 		stat_add(STAT_DROP_FW, 1);
 		v->drop = 1;
 		return 0;
 	}
+	if (rc == PARSE_NON_IP) {
+		stat_add(STAT_NON_IP, 1);
+		return 0;
+	}
+	if (p->key.l3 == L3_ARP) {
+		/* ARP is subject only to L2 rules, so IP policy cannot break it. */
+		stat_add(STAT_ARP, 1);
+		telemetry(p, now);
+		return 0;
+	}
 
-	if (load_balance(p, v, now)) {
+	/* Client-visible key: undo the backend address for load-balanced replies. */
+	struct lb_rev *rev = p->has_ports ? bpf_map_lookup_elem(&lb_reverse, &p->key) : 0;
+	struct flow_key ck = p->key;
+
+	if (rev) {
+		ck.saddr = rev->vip;
+		ck.sport = rev->vport;
+	}
+
+	if (firewall_ip(&ck, p->has_ports, cfg)) {
+		stat_add(STAT_DROP_FW, 1);
 		v->drop = 1;
 		return 0;
 	}
+	if (load_balance(p, rev, v, now)) {
+		v->drop = 1;
+		return 0;
+	}
+	if (cfg && (cfg->flags & CFG_F_FW_STATEFUL))
+		ct_touch(&ck, p, now);
+	telemetry(p, now);
 	return 0;
 }
 

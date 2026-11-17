@@ -9,24 +9,27 @@
 #include "util.h"
 
 /* ------------------------------------------------------------------ */
-/* Telemetry                                                           */
+/* Telemetry: per-flow counters for admitted traffic                   */
 /* ------------------------------------------------------------------ */
+/*
+ * flow_stats is a per-CPU LRU hash keyed by the exact flow key, so flows never
+ * share an entry (no collisions); when the table is full the least recently
+ * used flow is evicted. Only admitted packets are counted, so a flood of
+ * dropped packets cannot evict legitimate flows (drops are counted globally).
+ */
 static __always_inline void telemetry(struct pkt *p, __u64 now)
 {
-	__u32 slot = flow_hash(&p->key) & (FLOW_SLOTS - 1);
-	struct flow_stat *fs = bpf_map_lookup_elem(&flow_stats, &slot);
+	struct flow_stat *fs = bpf_map_lookup_elem(&flow_stats, &p->key);
 
-	if (!fs)
+	if (fs) {
+		fs->packets += 1;
+		fs->bytes += p->len;
+		fs->last_seen_ns = now;
 		return;
-	/* Per-CPU slot: on a hash collision the newest flow takes the slot. */
-	if (__builtin_memcmp(&fs->key, &p->key, sizeof(p->key)) != 0) {
-		__builtin_memcpy(&fs->key, &p->key, sizeof(p->key));
-		fs->packets = 0;
-		fs->bytes = 0;
 	}
-	fs->packets += 1;
-	fs->bytes += p->len;
-	fs->last_seen_ns = now;
+	struct flow_stat nfs = {.packets = 1, .bytes = p->len, .last_seen_ns = now};
+
+	bpf_map_update_elem(&flow_stats, &p->key, &nfs, BPF_NOEXIST);
 }
 
 #endif /* SDN_TELEMETRY_H */

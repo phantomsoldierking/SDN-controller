@@ -30,7 +30,7 @@ system and the results, see **[docs/GUIDE.md](docs/GUIDE.md)**.
 | `testbed/` | Mininet testbed: addressing, topology, a `Gateway` interface with eBPF / kernel / OVS implementations, Tests 1–4 |
 | `tests/` | Unit tests (no root) and kernel data-plane tests via `BPF_PROG_TEST_RUN` (root) |
 | `control_plane.py`, `topology.py` | Thin entry points for `sdn` and `testbed` |
-| `benchmark.sh` | Test 4 across eBPF-XDP, eBPF-TC, eBPF-TC+FIB, plain kernel and OVS+OpenFlow |
+| `benchmark.sh` | Test 4 across eBPF-XDP, eBPF-TC, eBPF-TC+FIB, plain kernel, nftables+IPVS, OVS and OVS+conntrack, repeated runs with 95% confidence intervals |
 | `services.json` | Example service definition for `control_plane.py daemon --services` |
 | `Makefile` | Build (`clang -O2 -target bpf` → `build/xdp_prog.o`), tests, lint, bench |
 
@@ -42,29 +42,43 @@ header access is preceded by an explicit `data_end` bounds check, so the
 verifier accepts it. Truncated or invalid headers are dropped and counted
 (`drop_malformed`).
 
-**Stateful firewall.** `firewall_map` is a `BPF_MAP_TYPE_HASH` whose key holds
-either a 5-tuple or a MAC 2-tuple (`kind` field). Lookups go from most to least
-specific:
+**Stateful firewall.** `firewall_map` is a `BPF_MAP_TYPE_HASH`. Every rule
+belongs to one of ten patterns, and the pattern id is part of the key, so an
+unspecified field is a true wildcard (a packet with port 0 or protocol 0 cannot
+match a wildcarded rule by accident). Lookups go from most to least specific
+and the first hit wins:
 
 ```
-MAC(src,dst) → MAC(src,*) → IP(proto,src,dst,sport,dport) → IP(proto,src,dst,*,dport)
-→ IP(proto,src,dst,sport,*) → IP(proto,src,dst,*,*) → IP(*,src,dst) → IP(*,src,*) → IP(*,*,dst)
+MAC(src,dst) → MAC(src,*)                                   every Ethernet frame
+IP(src,dst,sport,dport,proto) → IP(src,dst,*,dport,proto) → IP(src,dst,sport,*,proto)
+→ IP(src,dst,proto) → IP(src,dst) → IP(*,dst,*,dport,proto) → IP(src) → IP(dst)
 ```
 
-A `drop` hit returns `XDP_DROP` (or `TC_ACT_SHOT`). An `allow` hit, or no hit
-under the default `allow` policy, passes the packet. Allowed flows are recorded
-in `fw_conntrack` (an LRU hash). With `fw default drop`, reply traffic of
-tracked flows and load-balanced connections is still let through, as on a
-stateful firewall. Rule hit counters are updated atomically.
+`IP(*,dst,*,dport,proto)` is a service-port rule ("anyone may reach VIP:80").
+A `drop` hit returns `XDP_DROP` (or `TC_ACT_SHOT`) and always wins over
+connection state. Under the default `allow` policy, or on an `allow` hit, the
+packet passes. With `fw default drop`, unmatched packets pass only if their
+flow (or its reverse) is tracked in `fw_conntrack`. A connection uses a single
+entry: replies refresh it and set its `REPLY` flag. Load-balanced replies are
+judged by the flow the client sees (VIP → client), so rules written against the
+VIP apply in both directions and no state is ever created for a backend's real
+address. ARP is subject only to MAC rules.
 
 **L4 load balancer.**
 - `lb_services` (hash) maps `{VIP, port, proto}` to a service id.
 - `lb_backends` (`BPF_MAP_TYPE_ARRAY`) holds up to 16 backends per service.
 - New flows are hashed with a jhash mix over the 5-tuple and placed on the
   first *active* backend, probing linearly from there.
-- The choice is pinned in `lb_conntrack`, so connections stay sticky. If the
-  backend is drained, the connection is re-placed.
-- A reverse entry in `lb_reverse` handles the return path.
+- The choice is pinned in `lb_conntrack`, so connections stay sticky.
+  **Draining is graceful**: a drained backend gets no new connections, but its
+  existing connections continue until they close or expire. A connection is
+  re-placed only if its backend is removed or replaced, and then its stale
+  reverse-NAT entry is deleted.
+- A reverse entry in `lb_reverse` handles the return path. Packets in either
+  direction refresh both entries, so a server-to-client download keeps the
+  connection alive, and a reverse entry evicted by the LRU is re-created.
+- Backend endpoints must be disjoint across services (the reverse key does not
+  contain the VIP); `lb add-service` enforces this.
 
 On the forward path the destination is rewritten (DNAT); on the return path the
 source is rewritten back to the VIP (SNAT). Checksums are recomputed in the
@@ -81,9 +95,10 @@ interface. This bypasses the IP stack. If the lookup fails (for example, no
 neighbour entry yet), the packet goes to the stack instead.
 
 **Telemetry.**
-- `flow_stats` is a `BPF_MAP_TYPE_PERCPU_ARRAY` with 1024 slots indexed by
-  flow hash. Each slot holds the flow key plus packet, byte and last-seen
-  counters. The control plane merges the per-CPU copies.
+- `flow_stats` is a `BPF_MAP_TYPE_LRU_PERCPU_HASH` (16,384 entries) keyed by
+  the exact flow, holding packet, byte and last-seen counters for **admitted**
+  traffic. Flows never share an entry, and dropped floods cannot evict
+  legitimate flows. The control plane sums the per-CPU copies.
 - `global_stats` holds the pipeline counters: rx, pass, drops by reason,
   DNAT/SNAT, new connections, ARP, FIB forwards.
 
@@ -170,8 +185,10 @@ gateway's data plane, including traffic between two clients.
 | `--mode` | Gateway |
 |---|---|
 | `ebpf` | Linux router with `xdp_prog.c` on all eight gateway interfaces (`--hook xdp\|tc`, `--fib-forward`) |
-| `kernel` | the same router without eBPF (baseline) |
-| `ovs` | Open vSwitch bridge acting as the L3 gateway through OpenFlow 1.3 rules only. Table 0 holds ACL drops, the VIP → `select` group and stateless reverse-SNAT. Table 1 does routing (MAC rewrite + `dec_ttl`). |
+| `kernel` | the same router without eBPF and without policy (cost of forwarding alone) |
+| `nft-ipvs` | the same router with Linux's native stateful subsystems: nftables + conntrack (firewall) and IPVS in NAT mode with Maglev hashing (load balancer); draining = weight 0 |
+| `ovs` | Open vSwitch acting as the L3 gateway through stateless OpenFlow 1.3 rules: ACL drops, a VIP `select` group, stateless reverse-SNAT, routing |
+| `ovs-ct` | Open vSwitch with connection tracking: `ct(nat)` on all IP traffic, a `select` group whose buckets do `ct(commit,nat(dst=…))`, stateful admission; draining removes the bucket |
 
 Tests:
 
@@ -209,7 +226,9 @@ make lint                      # ruff, or pyflakes if ruff is missing
 sudo make test-bpf             # kernel data-plane tests (BPF_PROG_TEST_RUN), no Mininet
 sudo make test                 # Tests 1-3, XDP hook
 sudo make test-tc              # Tests 1-3, TC hook
-sudo ./benchmark.sh            # Test 4: ebpf-xdp ebpf-tc ebpf-tc-fib kernel ovs
+sudo ./benchmark.sh            # Test 4: all 7 configurations, 10 interleaved rounds
+sudo make microbench           # in-kernel per-packet cost vs rules / state / path
+sudo make experiments          # everything the paper reports, in one command
 sudo python3 topology.py --mode ebpf --cli   # interactive; e.g. `gw python3 control_plane.py stats`
 sudo make clean-net            # after an interrupted run: mn -c + remove pinned maps
 ```
@@ -267,11 +286,12 @@ Raw numbers are in `results/*.json`.
   `XDP_REDIRECT`. On veth this only works if the *peer* has an XDP program
   attached, so use it with `--hook tc` in Mininet, or with XDP on physical
   NICs.
-- **Firewall vs. NAT order.** Firewall rules are evaluated on the pre-NAT
-  tuple. To restrict who may reach a service, write the rule against the VIP.
-- **OVS baseline reverse NAT.** OpenFlow 1.3 has no conntrack, so the OVS
-  baseline uses stateless reverse NAT. Direct (non-VIP) HTTP to a backend's
-  port 80 is rewritten to the VIP in OVS mode.
-- **Telemetry collisions.** `flow_stats` is a fixed-size hash-indexed array.
-  On a slot collision the newest flow replaces the older one. Use `ct list`
-  for exact per-connection counters.
+- **Firewall and NAT.** Rules see the client view of load-balanced traffic
+  (client ↔ VIP). To restrict who may reach a service, write the rule against
+  the VIP; a client ↔ backend rule does not affect traffic through the VIP.
+- **Fragments.** Non-first IPv4 fragments have no ports: they skip the port
+  patterns, are not load-balanced and are tracked under a port-less key. There
+  is no reassembly.
+- **Stateless OVS baseline.** OpenFlow 1.3 has no conntrack, so `--mode ovs`
+  uses stateless reverse NAT and cannot drain without re-hashing existing
+  flows. `--mode ovs-ct` is the stateful OVS configuration.

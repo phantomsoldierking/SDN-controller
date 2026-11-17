@@ -3,17 +3,21 @@
 The scenarios and the benchmark only talk to `Gateway`; what actually
 forwards, filters and balances traffic depends on the implementation:
 
-    KernelGateway  Linux router, no policy (baseline)
-    EbpfGateway    Linux router + the eBPF data plane, driven through REST
-    OvsGateway     Open vSwitch with OpenFlow 1.3 rules (classical SDN)
+    KernelGateway    Linux router, no policy (baseline)
+    EbpfGateway      Linux router + the eBPF data plane, driven through REST
+    NetfilterGateway Linux router + nftables (stateful firewall) + IPVS (L4 LB)
+    OvsGateway       Open vSwitch, stateless OpenFlow 1.3 rules (classical SDN)
+    OvsCtGateway     Open vSwitch with connection tracking and NAT (ct/nat actions)
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
+import tempfile
 import time
 from abc import ABC, abstractmethod
 
@@ -59,7 +63,8 @@ class Gateway(ABC):
     def drop_count(self) -> int:
         raise Unsupported(f"{self.label} has no in-kernel drop counter")
 
-    def conntrack(self) -> dict:
+    def lb_connections(self) -> int:
+        """Number of tracked load-balanced connections."""
         raise Unsupported(f"{self.label} has no connection tracking")
 
     def report(self) -> str:
@@ -165,44 +170,129 @@ class EbpfGateway(KernelGateway):
     def drop_count(self) -> int:
         return self.rest("GET", "/stats")["drop_firewall"]
 
-    def conntrack(self) -> dict:
-        return self.rest("GET", "/conntrack")
+    def lb_connections(self) -> int:
+        tables = self.rest("GET", "/conntrack")
+        return min(len(tables["lb"]), len(tables["lb_reverse"]))
 
     def report(self) -> str:
         return self._cp("stats --top 10")
 
 
 # ---------------------------------------------------------------------------
+class NetfilterGateway(KernelGateway):
+    """The kernel router with Linux's native stateful subsystems: nftables with
+    connection tracking for the firewall and IPVS (NAT mode, Maglev hashing)
+    for the load balancer. Rules are inserted ahead of the conntrack accept, so
+    a drop rule wins over established state, as in the eBPF data plane."""
+    label = "nft-ipvs"
+    has_load_balancer = True
+
+    def _sh(self, cmd: str) -> str:
+        return sh(self.node, cmd, check=True)
+
+    def start(self) -> None:
+        super().start()
+        self.node.cmd("modprobe -q ip_vs; modprobe -q ip_vs_mh")
+        self.node.cmd("sysctl -qw net.ipv4.vs.conntrack=1")
+        ruleset = ("table inet sdn {\n"
+                   "  counter fwdrop { }\n"
+                   "  chain forward { type filter hook forward priority 0; policy accept;\n"
+                   "    ct state established,related accept\n  }\n}\n")
+        with tempfile.NamedTemporaryFile("w", suffix=".nft", delete=False) as f:
+            f.write(ruleset)  # Mininet hosts share the filesystem
+        try:
+            self._sh(f"nft -f {f.name}")
+        finally:
+            os.unlink(f.name)
+        self._rules: dict[tuple, list[int]] = {}
+
+    def _acl(self, src, dst, proto, dport, bidir):
+        pairs = [(src, dst)] + ([(dst, src)] if bidir else [])
+        l4 = f"{proto} dport {dport} " if dport else ("" if proto == "any" else f"ip protocol {proto} ")
+        return [f"ip saddr {s} ip daddr {d} {l4}counter name fwdrop drop" for s, d in pairs]
+
+    def block(self, src, dst, proto="any", dport=0, bidir=True) -> None:
+        handles = []
+        for rule in self._acl(src, dst, proto, dport, bidir):
+            out = self._sh(f"nft --echo --handle insert rule inet sdn forward {rule}")
+            handles.append(int(re.search(r"# handle (\d+)", out).group(1)))
+        self._rules[(src, dst, proto, dport, bidir)] = handles
+
+    def unblock(self, src, dst, proto="any", dport=0, bidir=True) -> None:
+        for h in self._rules.pop((src, dst, proto, dport, bidir), []):
+            self._sh(f"nft delete rule inet sdn forward handle {h}")
+
+    def drop_count(self) -> int:
+        m = re.search(r"packets (\d+)", self._sh("nft list counter inet sdn fwdrop"))
+        return int(m.group(1)) if m else 0
+
+    def add_service(self, vip, port, backends) -> None:
+        if getattr(self, "_service", None):
+            return
+        self._sh(f"ip addr add {vip}/32 dev lo")  # IPVS serves VIPs that are local
+        if not sh(self.node, f"ipvsadm -A -t {vip}:{port} -s mh -b mh-fallback,mh-port").strip() == "":
+            self._sh(f"ipvsadm -A -t {vip}:{port} -s rr")  # kernel without ip_vs_mh
+        for b in backends:
+            self._sh(f"ipvsadm -a -t {vip}:{port} -r {b.ip}:{port} -m -w 1")
+        self._service = (vip, port)
+
+    def set_backend(self, vip, port, backend, up) -> None:
+        # weight 0: no new connections; existing ones continue (graceful drain)
+        self._sh(f"ipvsadm -e -t {vip}:{port} -r {backend.ip}:{port} -m -w {1 if up else 0}")
+
+    def lb_connections(self) -> int:
+        vip, port = self._service
+        return sum(1 for line in self._sh("ipvsadm -Lnc").splitlines() if f"{vip}:{port}" in line)
+
+    def stop(self) -> None:
+        self.node.cmd("ipvsadm -C; nft delete table inet sdn")
+
+
+# ---------------------------------------------------------------------------
 class OvsGateway(Gateway):
-    """Classical SDN baseline: routing, ACL and LB purely as OpenFlow 1.3 rules.
+    """Classical SDN baseline: routing, ACL and LB purely as stateless OpenFlow
+    1.3 rules.
 
     table 0: ACL drops (prio 400) -> VIP select group / reverse NAT (prio 300)
-             -> ARP delivery (prio 100) -> goto table 1
+             -> ARP delivery (prio 100) -> goto table ROUTE
     table 1: L3 routing - rewrite MACs, dec_ttl, output
     """
     label = "ovs"
     has_load_balancer = True
     ACL_PRIORITY = 400
+    ROUTE_TABLE = 1
 
-    def _ofctl(self, *commands: str) -> None:
+    def _ofctl(self, *commands: str) -> str:
+        out = ""
         for c in commands:
-            out = self.node.cmd(f"ovs-ofctl -O OpenFlow13 {c}")
-            if out.strip():
-                raise RuntimeError(f"ovs-ofctl {c}: {out}")
+            res = self.node.cmd(f"ovs-ofctl -O OpenFlow13 {c}")
+            if res.strip() and not c.startswith("dump"):
+                raise RuntimeError(f"ovs-ofctl {c}: {res}")
+            out += res
+        return out
 
     def _add_flows(self, *flows: str) -> None:
         self._ofctl(*(f"add-flow gw {shlex.quote(f)}" for f in flows))
+
+    def _route(self, h: Host) -> str:
+        return (f"table={self.ROUTE_TABLE},priority=100,ip,nw_dst={h.ip},"
+                f"actions=set_field:{OVS_GW_MAC}->eth_src,set_field:{h.mac}->eth_dst,"
+                f"dec_ttl,output:{h.port}")
+
+    def _pipeline(self) -> list[str]:
+        return ["table=0,priority=0,actions=goto_table:1"]
 
     def start(self) -> None:
         for h in HOSTS:  # the bridge never answers ARP, so pin the gateway MAC
             self.net.get(h.name).cmd(f"ip neigh replace {h.gateway_ip} lladdr {OVS_GW_MAC} "
                                      f"dev {h.intf} nud permanent")
-        flows = ["table=0,priority=0,actions=goto_table:1"]
+        flows = self._pipeline()
         for h in HOSTS:
             flows.append(f"table=0,priority=100,arp,arp_tpa={h.ip},actions=output:{h.port}")
-            flows.append(f"table=1,priority=100,ip,nw_dst={h.ip},actions=set_field:{OVS_GW_MAC}"
-                         f"->eth_src,set_field:{h.mac}->eth_dst,dec_ttl,output:{h.port}")
+            flows.append(self._route(h))
         self._add_flows(*flows)
+        self._pool: list[Host] = []
+        self._active: set[str] = set()
 
     def _acl(self, src, dst, proto, dport, bidir) -> list[str]:
         match = "ip" if proto == "any" else proto
@@ -217,17 +307,72 @@ class OvsGateway(Gateway):
         self._ofctl(*(f"del-flows gw --strict {shlex.quote(m)}"
                       for m in self._acl(src, dst, proto, dport, bidir)))
 
-    def add_service(self, vip, port, backends) -> None:
-        buckets = ",".join(f"bucket=set_field:{b.ip}->ip_dst,set_field:{OVS_GW_MAC}->eth_src,"
-                           f"set_field:{b.mac}->eth_dst,dec_ttl,output:{b.port}"
-                           for b in backends)
-        self._ofctl(f"add-group gw {shlex.quote(f'group_id=1,type=select,{buckets}')}")
-        # OpenFlow 1.3 has no conntrack, so the reverse NAT is stateless:
+    def drop_count(self) -> int:
+        """Packets matched by ACL drop rules (OpenFlow counters, kept by the kernel datapath)."""
+        self.node.cmd("ovs-appctl revalidator/wait")  # sync datapath stats into rules
+        out = self._ofctl("dump-flows gw table=0")
+        return sum(int(m.group(1)) for line in out.splitlines()
+                   if f"priority={self.ACL_PRIORITY}," in line and "actions=drop" in line
+                   for m in [re.search(r"n_packets=(\d+)", line)] if m)
+
+    def _bucket(self, b: Host, port: int) -> str:
+        return (f"bucket=set_field:{b.ip}->ip_dst,set_field:{OVS_GW_MAC}->eth_src,"
+                f"set_field:{b.mac}->eth_dst,dec_ttl,output:{b.port}")
+
+    def _write_group(self, port: int, command: str) -> None:
+        buckets = ",".join(self._bucket(b, port) for b in self._pool if b.name in self._active)
+        self._ofctl(f"{command} gw {shlex.quote(f'group_id=1,type=select,{buckets}')}")
+
+    def _service_flows(self, vip: str, port: int) -> list[str]:
+        # No conntrack in OpenFlow 1.3, so the reverse NAT is stateless:
         # every reply from a backend's service port to a client is rewritten.
-        self._add_flows(f"table=0,priority=300,tcp,nw_dst={vip},tp_dst={port},actions=group:1",
-                        *(f"table=0,priority=300,tcp,nw_src={b.ip},tp_src={port},"
-                          f"nw_dst=10.0.1.0/24,actions=set_field:{vip}->ip_src,goto_table:1"
-                          for b in backends))
+        return [f"table=0,priority=300,tcp,nw_dst={vip},tp_dst={port},actions=group:1",
+                *(f"table=0,priority=300,tcp,nw_src={b.ip},tp_src={port},"
+                  f"nw_dst=10.0.1.0/24,actions=set_field:{vip}->ip_src,goto_table:1"
+                  for b in self._pool)]
+
+    def add_service(self, vip, port, backends) -> None:
+        if self._pool:
+            return
+        self._pool, self._active, self._vip = list(backends), {b.name for b in backends}, vip
+        self._write_group(port, "add-group")
+        self._add_flows(*self._service_flows(vip, port))
+
+    def set_backend(self, vip, port, backend, up) -> None:
+        """Remove (or restore) the backend's bucket. Without conntrack, flows that
+        hashed to it are re-hashed; with conntrack (OvsCtGateway) they continue."""
+        (self._active.add if up else self._active.discard)(backend.name)
+        self._write_group(port, "mod-group")
+
+
+class OvsCtGateway(OvsGateway):
+    """OVS with connection tracking (Nicira ct/nat extensions, kernel nf_conntrack).
+
+    table 0: ACL drops (prio 400), ARP (prio 100), then ct(nat) -> table 1
+    table 1: new VIP connection -> select group whose buckets ct(commit,nat(dst))
+             other new flows -> ct(commit); established/related -> routing
+    table 2: L3 routing
+    """
+    label = "ovs-ct"
+    ROUTE_TABLE = 2
+
+    def _pipeline(self) -> list[str]:
+        return ["table=0,priority=10,ip,actions=ct(table=1,nat)",
+                "table=1,priority=100,ct_state=+trk+new,ip,actions=ct(commit,table=2)",
+                "table=1,priority=100,ct_state=+trk+est,ip,actions=goto_table:2",
+                "table=1,priority=100,ct_state=+trk+rel,ip,actions=goto_table:2",
+                "table=1,priority=0,actions=drop"]
+
+    def _bucket(self, b: Host, port: int) -> str:
+        return f"bucket=ct(commit,table=2,nat(dst={b.ip}:{port}))"
+
+    def _service_flows(self, vip: str, port: int) -> list[str]:
+        return [f"table=1,priority=200,ct_state=+trk+new,tcp,nw_dst={vip},tp_dst={port},"
+                "actions=group:1"]
+
+    def lb_connections(self) -> int:
+        out = self.node.cmd("ovs-appctl dpctl/dump-conntrack")
+        return sum(1 for line in out.splitlines() if f"dst={self._vip}," in line and "tcp" in line)
 
 
 def make_gateway(net, mode: str, hook: str = "xdp", xdp_mode: str = "auto",
@@ -236,5 +381,9 @@ def make_gateway(net, mode: str, hook: str = "xdp", xdp_mode: str = "auto",
         return EbpfGateway(net, hook, xdp_mode, fib_forward, logdir)
     if mode == "ovs":
         return OvsGateway(net)
+    if mode == "ovs-ct":
+        return OvsCtGateway(net)
+    if mode == "nft-ipvs":
+        return NetfilterGateway(net)
     return KernelGateway(net)
 

@@ -57,6 +57,7 @@ def test_load_balancer(net, gw: Gateway, report: Report, requests: int) -> None:
         fails += r["fail"]
         for backend, n in r["backends"].items():
             totals[backend] = totals.get(backend, 0) + n
+    report.data["t3_backend_counts"] = {s.name: totals.get(s.name, 0) for s in SERVERS}
     answered = sum(totals.values())
     report.add("T3a all requests to VIP answered", fails == 0 and answered > 0,
                f"{answered} ok, {fails} failed")
@@ -65,10 +66,8 @@ def test_load_balancer(net, gw: Gateway, report: Report, requests: int) -> None:
                ", ".join(f"{s.name}={totals.get(s.name, 0)}" for s in SERVERS))
 
     try:
-        tables = gw.conntrack()
-        report.add("T3c conntrack populated (lb + reverse NAT)",
-                   bool(tables["lb"]) and bool(tables["lb_reverse"]),
-                   f"{len(tables['lb'])} lb / {len(tables['lb_reverse'])} reverse entries")
+        n = gw.lb_connections()
+        report.add("T3c connection tracking populated", n > 0, f"{n} tracked LB connections")
     except Unsupported as e:
         report.skip("T3c conntrack", str(e))
 
@@ -79,6 +78,7 @@ def test_load_balancer(net, gw: Gateway, report: Report, requests: int) -> None:
         report.skip("T3d backend draining", str(e))
         return
     r = probe(net.get(CLIENTS[0].name), url, requests)
+    report.data["t3_after_drain"] = r["backends"]
     report.add(f"T3d drained backend {drained.name} receives no new connections",
                r["fail"] == 0 and drained.name not in r["backends"], str(r["backends"]))
     gw.set_backend(VIP, VPORT, drained, up=True)

@@ -53,9 +53,9 @@ struct {
 } lb_reverse SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, FLOW_SLOTS);
-	__type(key, __u32);
+	__uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
+	__uint(max_entries, FLOW_TABLE_SIZE);
+	__type(key, struct flow_key);
 	__type(value, struct flow_stat);
 } flow_stats SEC(".maps");
 

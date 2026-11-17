@@ -1,0 +1,20 @@
+{
+  "mode": "ebpf-tc-fib",
+  "duration_s": 10,
+  "client_cpu": "0",
+  "server_cpu": "2",
+  "tcp_gbps": 10.235,
+  "udp64_rx_pps": 609446,
+  "udp64_loss_pct": 0.04,
+  "rtt_min_ms": 0.001,
+  "rtt_avg_ms": 0.002,
+  "rtt_max_ms": 0.027,
+  "rtt_mdev_ms": 0.002,
+  "lb_rps": 1327.4,
+  "lb_avg_ms": 0.753,
+  "lb_fail": 0,
+  "fw_drop_pps": 867620,
+  "fw_drop_sent": 2603008,
+  "fw_dropped": 2603008,
+  "fw_drop_seconds": 3.00017
+}

@@ -12,110 +12,107 @@
 /* ------------------------------------------------------------------ */
 /* Stateful firewall                                                   */
 /* ------------------------------------------------------------------ */
-static __always_inline struct fw_rule *fw_try(struct fw_key *k)
+static __always_inline __u32 fw_hit(struct fw_key *k)
 {
-	return bpf_map_lookup_elem(&firewall_map, k);
-}
+	struct fw_rule *r = bpf_map_lookup_elem(&firewall_map, k);
 
-/*
- * Lookup order, most specific first:
- *   MAC (src, dst) -> MAC (src, *)
- *   IP  (proto, src, dst, sport, dport)
- *   IP  (proto, src, dst, *,     dport)
- *   IP  (proto, src, dst, sport, *)
- *   IP  (proto, src, dst, *,     *)
- *   IP  (*,     src, dst, *,     *)
- *   IP  (*,     src, *,   *,     *)
- *   IP  (*,     *,   dst, *,     *)
- */
-static __always_inline __u32 fw_lookup(struct pkt *p)
-{
-	struct fw_key k;
-	struct fw_rule *r;
-
-	__builtin_memset(&k, 0, sizeof(k));
-	k.kind = FW_KIND_MAC;
-	__builtin_memcpy(k.smac, p->eth->h_source, ETH_ALEN);
-	__builtin_memcpy(k.dmac, p->eth->h_dest, ETH_ALEN);
-	r = fw_try(&k);
-	if (r)
-		goto hit;
-	__builtin_memset(k.dmac, 0, ETH_ALEN);
-	r = fw_try(&k);
-	if (r)
-		goto hit;
-
-	if (p->key.l3 != L3_IPV4)
+	if (!r)
 		return ACT_NONE;
-
-	__builtin_memset(&k, 0, sizeof(k));
-	k.kind = FW_KIND_IP;
-	k.proto = p->key.proto;
-	k.saddr = p->key.saddr;
-	k.daddr = p->key.daddr;
-	k.sport = p->key.sport;
-	k.dport = p->key.dport;
-	if (p->has_ports) {
-		r = fw_try(&k);
-		if (r)
-			goto hit;
-		k.sport = 0;
-		r = fw_try(&k);
-		if (r)
-			goto hit;
-		k.sport = p->key.sport;
-		k.dport = 0;
-		r = fw_try(&k);
-		if (r)
-			goto hit;
-		k.sport = 0;
-	}
-	r = fw_try(&k);
-	if (r)
-		goto hit;
-	k.proto = 0;
-	r = fw_try(&k);
-	if (r)
-		goto hit;
-	k.daddr = 0;
-	r = fw_try(&k);
-	if (r)
-		goto hit;
-	k.saddr = 0;
-	k.daddr = p->key.daddr;
-	r = fw_try(&k);
-	if (r)
-		goto hit;
-	return ACT_NONE;
-
-hit:
-	__sync_fetch_and_add(&r->hits, 1);
+	__sync_fetch_and_add(&r->hits, 1); /* rules are shared by all CPUs */
 	return r->action;
 }
 
-static __always_inline void ct_touch(struct flow_key *k, struct pkt *p, __u64 now)
+/* L2 rules (patterns 1-2); applied to every Ethernet frame, IP or not. */
+static __always_inline __u32 fw_mac_lookup(const struct ethhdr *eth)
+{
+	struct fw_key k;
+	__u32 a;
+
+	__builtin_memset(&k, 0, sizeof(k));
+	k.kind = FW_KIND_MAC;
+	k.mask = FW_M_MAC_PAIR;
+	__builtin_memcpy(k.smac, eth->h_source, ETH_ALEN);
+	__builtin_memcpy(k.dmac, eth->h_dest, ETH_ALEN);
+	a = fw_hit(&k);
+	if (a != ACT_NONE)
+		return a;
+	k.mask = FW_M_MAC_SRC;
+	__builtin_memset(k.dmac, 0, ETH_ALEN);
+	return fw_hit(&k);
+}
+
+static __always_inline __u32 fw_ip_try(struct fw_key *k, __u8 mask, const struct flow_key *f,
+				       __u32 fields)
+{
+#define F_S (1U << 0)
+#define F_D (1U << 1)
+#define F_SP (1U << 2)
+#define F_DP (1U << 3)
+#define F_P (1U << 4)
+	k->mask = mask;
+	k->saddr = (fields & F_S) ? f->saddr : 0;
+	k->daddr = (fields & F_D) ? f->daddr : 0;
+	k->sport = (fields & F_SP) ? f->sport : 0;
+	k->dport = (fields & F_DP) ? f->dport : 0;
+	k->proto = (fields & F_P) ? f->proto : 0;
+	return fw_hit(k);
+}
+
+/*
+ * L3/L4 rules (patterns 3-10), most specific first; the first hit wins.
+ * `f` is the client-visible flow key (see pipeline.h). Port patterns only
+ * apply when the packet has ports (TCP/UDP, not a non-first fragment).
+ */
+static __always_inline __u32 fw_ip_lookup(const struct flow_key *f, int has_ports)
+{
+	struct fw_key k;
+	__u32 a;
+
+	__builtin_memset(&k, 0, sizeof(k));
+	k.kind = FW_KIND_IP;
+	if (has_ports) {
+		if ((a = fw_ip_try(&k, FW_M_IP_EXACT, f, F_S | F_D | F_SP | F_DP | F_P)))
+			return a;
+		if ((a = fw_ip_try(&k, FW_M_IP_DPORT, f, F_S | F_D | F_DP | F_P)))
+			return a;
+		if ((a = fw_ip_try(&k, FW_M_IP_SPORT, f, F_S | F_D | F_SP | F_P)))
+			return a;
+	}
+	if ((a = fw_ip_try(&k, FW_M_IP_PROTO, f, F_S | F_D | F_P)))
+		return a;
+	if ((a = fw_ip_try(&k, FW_M_IP_PAIR, f, F_S | F_D)))
+		return a;
+	if (has_ports && (a = fw_ip_try(&k, FW_M_SVC_PORT, f, F_D | F_DP | F_P)))
+		return a;
+	if ((a = fw_ip_try(&k, FW_M_IP_SRC, f, F_S)))
+		return a;
+	return fw_ip_try(&k, FW_M_IP_DST, f, F_D);
+#undef F_S
+#undef F_D
+#undef F_SP
+#undef F_DP
+#undef F_P
+}
+
+/* Record or refresh an admitted flow. A reply refreshes the original entry
+ * (and marks it REPLY) instead of creating a second one. */
+static __always_inline void ct_touch(const struct flow_key *k, struct pkt *p, __u64 now)
 {
 	struct ct_entry *ct = bpf_map_lookup_elem(&fw_conntrack, k);
+	__u32 extra = 0;
 
+	if (!ct) {
+		struct flow_key rk;
+
+		reverse_key(k, &rk);
+		ct = bpf_map_lookup_elem(&fw_conntrack, &rk);
+		extra = CT_F_REPLY;
+	}
 	if (ct) {
 		ct->last_seen_ns = now;
 		ct->packets += 1;
 		ct->bytes += p->len;
-		ct->flags |= tcp_ct_flags(p);
-		return;
-	}
-
-	struct flow_key rk;
-	struct ct_entry *rct;
-
-	/* Reply direction of a tracked flow: mark the original as REPLY seen. */
-	reverse_key(k, &rk);
-	rct = bpf_map_lookup_elem(&fw_conntrack, &rk);
-	if (rct) {
-		rct->last_seen_ns = now;
-		rct->packets += 1;
-		rct->bytes += p->len;
-		rct->flags |= CT_F_REPLY | tcp_ct_flags(p);
+		ct->flags |= extra | tcp_ct_flags(p);
 		return;
 	}
 
@@ -129,42 +126,37 @@ static __always_inline void ct_touch(struct flow_key *k, struct pkt *p, __u64 no
 	bpf_map_update_elem(&fw_conntrack, k, &nct, BPF_ANY);
 }
 
-static __always_inline int ct_established(struct flow_key *k)
+/* E(f): the flow, or its reverse, is already tracked. */
+static __always_inline int ct_established(const struct flow_key *k)
 {
 	struct flow_key rk;
 
 	if (bpf_map_lookup_elem(&fw_conntrack, k))
 		return 1;
 	reverse_key(k, &rk);
-	if (bpf_map_lookup_elem(&fw_conntrack, &rk))
-		return 1;
-	/* Return traffic of a load-balanced connection. */
-	if (bpf_map_lookup_elem(&lb_reverse, k))
-		return 1;
-	return 0;
+	return bpf_map_lookup_elem(&fw_conntrack, &rk) != 0;
 }
 
-/* Returns 1 if the packet must be dropped. */
-static __always_inline int firewall(struct pkt *p, struct dp_config *cfg, __u64 now)
+/*
+ * Admission decision for an IPv4 packet with client-visible key `f`
+ * (Eq. 4 of the paper). Returns 1 if the packet must be dropped.
+ */
+static __always_inline int firewall_ip(const struct flow_key *f, int has_ports,
+				       struct dp_config *cfg)
 {
-	__u32 action = fw_lookup(p);
+	__u32 action = fw_ip_lookup(f, has_ports);
 	int stateful = cfg && (cfg->flags & CFG_F_FW_STATEFUL);
 
 	if (action == ACT_DROP)
 		return 1;
-
-	if (p->key.l3 != L3_IPV4)
-		return 0; /* ARP is only subject to explicit MAC rules */
-
-	if (action == ACT_NONE && cfg && cfg->default_action == ACT_DROP) {
-		if (!stateful || !ct_established(&p->key))
-			return 1;
+	if (action == ACT_ALLOW || !cfg || cfg->default_action != ACT_DROP)
+		return 0;
+	/* no rule matched and the default is DROP: admit established flows only */
+	if (stateful && ct_established(f)) {
 		stat_add(STAT_CT_ESTABLISHED, 1);
+		return 0;
 	}
-
-	if (stateful)
-		ct_touch(&p->key, p, now);
-	return 0;
+	return 1;
 }
 
 #endif /* SDN_FIREWALL_H */

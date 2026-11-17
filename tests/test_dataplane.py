@@ -5,6 +5,7 @@ import ctypes as ct
 import unittest
 
 from sdn import abi
+from sdn.abi import FwMask
 from sdn.codec import flow_key, ip_to_wire, port_to_wire
 from sdn.dataplane import DataPlane, FirewallRule, Timeouts
 from sdn.maps import in_memory_maps
@@ -28,10 +29,29 @@ class FirewallRuleTest(unittest.TestCase):
         self.assertEqual((fwd.sport, fwd.dport), (0, port_to_wire(22)))
         self.assertEqual((rev.sport, rev.dport), (port_to_wire(22), 0))
 
+    def test_each_rule_shape_maps_to_one_pattern(self):
+        cases = {
+            FwMask.IP_EXACT: FirewallRule(src=C1, dst=S2, proto="tcp", sport=1, dport=22),
+            FwMask.IP_DPORT: FirewallRule(src=C1, dst=S2, proto="tcp", dport=22),
+            FwMask.IP_SPORT: FirewallRule(src=C1, dst=S2, proto="udp", sport=53),
+            FwMask.IP_PROTO: FirewallRule(src=C1, dst=S2, proto="icmp"),
+            FwMask.IP_PAIR: FirewallRule(src=C1, dst=S2),
+            FwMask.SVC_PORT: FirewallRule(dst=VIP, proto="tcp", dport=80),
+            FwMask.IP_SRC: FirewallRule(src=C1),
+            FwMask.IP_DST: FirewallRule(dst=S2),
+            FwMask.MAC_PAIR: FirewallRule(src_mac="00:00:00:00:01:01", dst_mac="00:00:00:00:00:fe"),
+            FwMask.MAC_SRC: FirewallRule(src_mac="00:00:00:00:01:01"),
+        }
+        for mask, rule in cases.items():
+            with self.subTest(mask=mask):
+                self.assertEqual([k.mask for k in rule.keys()], [mask])
+
     def test_validation(self):
         for bad in (FirewallRule(),                                 # nothing to match
                     FirewallRule(src=C1, dst=S2, dport=22),         # port without tcp/udp
-                    FirewallRule(src=C1, proto="tcp"),              # proto needs src+dst
+                    FirewallRule(src=C1, proto="tcp"),              # src+proto: no such pattern
+                    FirewallRule(dst=VIP, proto="tcp"),             # dst+proto without port
+                    FirewallRule(dst=VIP, proto="tcp", dport=80, bidir=True),  # no reverse form
                     FirewallRule(dst_mac="00:00:00:00:00:01"),      # MAC rule needs src_mac
                     FirewallRule(src=C1, action="reject")):         # unknown action
             with self.subTest(rule=bad), self.assertRaises(ValueError):
@@ -65,6 +85,13 @@ class FirewallTest(unittest.TestCase):
         dp.firewall.add(FirewallRule(src=C1, dst=S3))
         remaining = [(k.saddr, k.daddr) for k in fw_ct.keys()]
         self.assertEqual(remaining, [(ip_to_wire(C1), ip_to_wire(S2))])
+
+    def test_drop_rule_on_vip_flushes_its_reverse_nat_entries(self):
+        dp = new_dp()
+        rev = flow_key(S2, C1, 80, 1000, 6)
+        dp.maps["lb_reverse"].update(rev, abi.LbRev(vip=ip_to_wire(VIP), vport=port_to_wire(80)))
+        dp.firewall.add(FirewallRule(src=C1, dst=VIP))
+        self.assertEqual(dp.maps["lb_reverse"].keys(), [])
 
     def test_allow_rule_keeps_conntrack(self):
         dp = new_dp()
@@ -111,6 +138,14 @@ class LoadBalancerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             dp.lb.set_backend_state("10.100.0.9", 80, "10.0.2.1", up=False)
 
+    def test_backends_must_be_disjoint_across_services(self):
+        dp = new_dp()
+        dp.lb.add_service(VIP, 80, ["10.0.2.1:80", "10.0.2.2:80"])
+        with self.assertRaises(ValueError):
+            dp.lb.add_service("10.100.0.2", 80, ["10.0.2.2:80"])
+        dp.lb.add_service("10.100.0.2", 80, ["10.0.2.2:8080"])   # other port: fine
+        dp.lb.add_service(VIP, 80, ["10.0.2.1:80"])              # re-adding itself: fine
+
     def test_delete_service(self):
         dp = new_dp()
         dp.lb.add_service(VIP, 80, ["10.0.2.1"])
@@ -154,6 +189,36 @@ class ConntrackExpiryTest(unittest.TestCase):
         self.dp.conntrack.expire(self.t, now_ns=self.now)
         self.assertEqual(self.dp.maps["lb_reverse"].keys(), [])
 
+    def test_entry_refreshed_by_data_plane_is_not_deleted(self):
+        class RefreshingMap:
+            """Simulates a packet refreshing the entry between read and delete."""
+            def __init__(self, inner, now):
+                self.inner, self.now, self.reads = inner, now, 0
+
+            def items(self):
+                return self.inner.items()
+
+            def keys(self):
+                return self.inner.keys()
+
+            def delete(self, k):
+                return self.inner.delete(k)
+
+            def update(self, k, v):
+                self.inner.update(k, v)
+
+            def lookup(self, k):
+                v = self.inner.lookup(k)
+                if v is not None:
+                    v.last_seen_ns = self.now  # refreshed by an in-flight packet
+                return v
+
+        key = flow_key(C1, S2, 5, 6, 6)
+        self.dp.maps["fw_conntrack"].update(key, abi.CtEntry(
+            created_ns=self.now - 100 * SEC, last_seen_ns=self.now - 100 * SEC))
+        self.dp.conntrack._fw = RefreshingMap(self.dp.maps["fw_conntrack"], self.now)
+        self.assertEqual(self.dp.conntrack.expire(self.t, self.now)["fw_conntrack"], 0)
+
     def test_hard_timeout(self):
         key = flow_key(C1, S2, 5, 6, 6)
         self.dp.maps["fw_conntrack"].update(key, abi.CtEntry(
@@ -174,8 +239,8 @@ class TelemetryTest(unittest.TestCase):
     def test_flows_merged_across_cpus(self):
         dp = new_dp()
         key = flow_key(C1, S2, 1000, 80, 6)
-        dp.maps["flow_stats"].update(ct.c_uint32(5), [
-            abi.FlowStat(key=key, packets=2, bytes=200), abi.FlowStat(key=key, packets=3, bytes=300)])
+        dp.maps["flow_stats"].update(key, [abi.FlowStat(packets=2, bytes=200),
+                                           abi.FlowStat(packets=3, bytes=300)])
         (flow,) = dp.telemetry.top_flows()
         self.assertEqual((flow["src"], flow["packets"], flow["bytes"]), (C1, 5, 500))
 

@@ -6,7 +6,9 @@
 #   sudo make test-bpf   kernel data-plane tests via BPF_PROG_TEST_RUN (no Mininet)
 #   sudo make test       Mininet Tests 1-3, XDP hook
 #   sudo make test-tc    Mininet Tests 1-3, TC hook
-#   sudo make bench      Test 4 across eBPF / kernel / OVS configurations
+#   sudo make bench      Test 4 across all configurations (repeated runs, 95% CI)
+#   sudo make microbench in-kernel per-packet cost vs rules / state / path
+#   sudo make experiments  everything the paper reports: tests + microbench + bench
 #   sudo make clean-net  tear down leftover Mininet / BPF state
 
 CLANG   ?= clang
@@ -21,7 +23,8 @@ OBJ        := build/xdp_prog.o
 PIN_DIR    ?= /sys/fs/bpf/sdn_dp
 PY_SRCS    := control_plane.py topology.py sdn testbed tests
 
-.PHONY: all build toolchain check unittest test-bpf test test-tc bench lint clean clean-net \
+.PHONY: all build toolchain check unittest test-bpf test test-tc bench microbench experiments \
+        lint clean clean-net \
         deps-debian deps-arch
 
 all: build
@@ -45,7 +48,9 @@ $(OBJ): $(BPF_SRCS) | toolchain
 check: $(OBJ) unittest
 	@llvm-objdump -h $(OBJ) | grep -qE ' xdp ' && llvm-objdump -h $(OBJ) | grep -qE ' tc ' \
 	    && echo "object: xdp + tc programs present"
-	@$(PYTHON) -m compileall -q $(PY_SRCS) && echo "python: compiles"
+	@find $(PY_SRCS) -name '*.py' -exec $(PYTHON) -c \
+	    'import ast, sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' {} + \
+	    && echo "python: parses"
 	@bash -n benchmark.sh && echo "benchmark.sh: syntax OK"
 
 unittest:
@@ -63,6 +68,12 @@ test-tc: $(OBJ)
 bench: $(OBJ)
 	./benchmark.sh
 
+microbench: $(OBJ)
+	$(PYTHON) -m testbed.microbench --out results/repeated/microbench.json
+
+experiments: $(OBJ)
+	./run_experiments.sh
+
 lint:
 	@command -v ruff >/dev/null && ruff check $(PY_SRCS) \
 	    || $(PYTHON) -m pyflakes $(PY_SRCS)
@@ -77,9 +88,9 @@ clean-net:
 
 deps-debian:
 	apt-get install -y clang llvm libbpf-dev libbpf1 linux-libc-dev \
-	    mininet openvswitch-switch iperf3 iproute2 ethtool curl python3
+	    mininet openvswitch-switch iperf3 iproute2 ethtool curl python3 nftables ipvsadm
 
 deps-arch:
 	pacman -S --needed clang llvm libbpf linux-api-headers iperf3 iproute2 \
-	    ethtool curl python openvswitch
+	    ethtool curl python openvswitch nftables ipvsadm
 	@echo "Mininet: install from the AUR (yay -S mininet)"

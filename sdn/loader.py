@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from . import BPF_OBJ, BPF_SRC, BPF_SRC_DIR, PIN_DIR
 from .libbpf import (BPF_TC_EGRESS, BPF_TC_F_REPLACE, BPF_TC_INGRESS, XDP_FLAGS, BpfError,
-                     TcHook, TcOpts, get_libbpf)
+                     TcHook, TcOpts, TestRunOpts, get_libbpf)
 
 log = logging.getLogger("sdn.loader")
 
@@ -137,6 +137,22 @@ class LoadedObject:
                             f"tc attach {iface}")
         log.info("%s attached to %s (ifindex %d, hook=%s%s)", self.program, iface, idx,
                  self.hook, f", mode={xdp_mode}" if self.hook == "xdp" else "")
+
+    def test_run(self, frame: bytes, repeat: int = 1) -> tuple[int, bytes, int]:
+        """Run the program on `frame` with BPF_PROG_TEST_RUN (no interface needed).
+
+        Returns (verdict, output frame, duration in ns). With repeat > 1 the
+        kernel runs the program `repeat` times on the same buffer and reports
+        the mean time per run."""
+        out = ct.create_string_buffer(len(frame) + 256)
+        inp = ct.create_string_buffer(frame, len(frame))
+        opts = TestRunOpts(sz=ct.sizeof(TestRunOpts), data_in=ct.cast(inp, ct.c_void_p),
+                           data_out=ct.cast(out, ct.c_void_p), data_size_in=len(frame),
+                           data_size_out=len(out), repeat=repeat)
+        rc = self._lib.bpf_prog_test_run_opts(self.prog_fd, ct.byref(opts))
+        if rc < 0:
+            raise BpfError(f"BPF_PROG_TEST_RUN failed: {os.strerror(-rc)}")
+        return opts.retval, out.raw[:opts.data_size_out], opts.duration
 
     def close(self) -> None:
         """Release the object. Attachments and pinned maps keep the program alive."""
