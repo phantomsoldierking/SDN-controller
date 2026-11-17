@@ -55,6 +55,7 @@ _SIGNATURES = {
     "bpf_program__name": (ct.c_char_p, [_vp]),
     "bpf_program__set_autoload": (_int, [_vp, ct.c_bool]),
     "bpf_map__name": (ct.c_char_p, [_vp]),
+    "bpf_object__find_map_fd_by_name": (_int, [_vp, ct.c_char_p]),
     "bpf_map__set_pin_path": (_int, [_vp, ct.c_char_p]),
     "bpf_xdp_attach": (_int, [_int, _int, _u32, _vp]),
     "bpf_xdp_detach": (_int, [_int, _u32, _vp]),

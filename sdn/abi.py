@@ -64,7 +64,7 @@ CT_F_REPLY = 1 << 3
 STAT_NAMES = (
     "rx_packets", "rx_bytes", "pass", "drop_firewall", "drop_malformed",
     "drop_no_backend", "lb_dnat", "lb_snat", "lb_new_conn", "ct_established",
-    "arp", "non_ip", "fib_forward",
+    "arp", "non_ip", "fib_forward", "drop_isolation", "lb_recovered",
 )
 
 
@@ -99,7 +99,17 @@ class SvcKey(ct.Structure):
 
 
 class SvcInfo(ct.Structure):
-    _fields_ = [("id", ct.c_uint32), ("count", ct.c_uint32)]
+    _fields_ = [("id", ct.c_uint32), ("count", ct.c_uint16), ("active", ct.c_uint16)]
+
+
+class EndpointKey(ct.Structure):
+    _fields_ = [("ip", ct.c_uint32), ("port", ct.c_uint16), ("proto", ct.c_uint8),
+                ("pad", ct.c_uint8)]
+
+
+class EndpointInfo(ct.Structure):
+    _fields_ = [("vip", ct.c_uint32), ("vport", ct.c_uint16), ("svc_id", ct.c_uint8),
+                ("be_idx", ct.c_uint8)]
 
 
 class Backend(ct.Structure):
@@ -115,8 +125,9 @@ class LbCt(ct.Structure):
 
 
 class LbRev(ct.Structure):
-    _fields_ = [("vip", ct.c_uint32), ("vport", ct.c_uint16), ("pad", ct.c_uint16),
-                ("last_seen_ns", ct.c_uint64), ("flags", ct.c_uint32), ("pad2", ct.c_uint32)]
+    _fields_ = [("vip", ct.c_uint32), ("vport", ct.c_uint16), ("svc_id", ct.c_uint8),
+                ("be_idx", ct.c_uint8), ("last_seen_ns", ct.c_uint64), ("flags", ct.c_uint32),
+                ("pad2", ct.c_uint32)]
 
 
 class FlowStat(ct.Structure):
@@ -125,7 +136,8 @@ class FlowStat(ct.Structure):
 
 
 class DpConfig(ct.Structure):
-    _fields_ = [("default_action", ct.c_uint32), ("flags", ct.c_uint32)]
+    _fields_ = [("default_action", ct.c_uint32), ("flags", ct.c_uint32),
+                ("pattern_mask", ct.c_uint32), ("pad", ct.c_uint32)]
 
 
 # ---- map catalogue ---------------------------------------------------------
@@ -141,6 +153,8 @@ MAP_SPECS = {
     "fw_conntrack": MapSpec(FlowKey, CtEntry),
     "lb_services": MapSpec(SvcKey, SvcInfo),
     "lb_backends": MapSpec(ct.c_uint32, Backend),
+    "lb_active": MapSpec(ct.c_uint32, ct.c_uint32),
+    "lb_endpoints": MapSpec(EndpointKey, EndpointInfo),
     "lb_conntrack": MapSpec(FlowKey, LbCt),
     "lb_reverse": MapSpec(FlowKey, LbRev),
     "flow_stats": MapSpec(FlowKey, FlowStat, percpu=True),
@@ -151,7 +165,8 @@ MAP_SPECS = {
 CONNTRACK_MAPS = ("fw_conntrack", "lb_conntrack", "lb_reverse")
 
 _EXPECTED_SIZES = {FlowKey: 16, FwKey: 28, FwRule: 16, CtEntry: 40, SvcKey: 8, SvcInfo: 8,
-                   Backend: 8, LbCt: 48, LbRev: 24, FlowStat: 24, DpConfig: 8}
+                   Backend: 8, LbCt: 48, LbRev: 24, FlowStat: 24, DpConfig: 16,
+                   EndpointKey: 8, EndpointInfo: 8}
 for _struct, _size in _EXPECTED_SIZES.items():
     if ct.sizeof(_struct) != _size:
         raise ImportError(f"ABI mismatch: sizeof({_struct.__name__}) = {ct.sizeof(_struct)}, "

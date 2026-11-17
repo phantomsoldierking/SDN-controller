@@ -1,0 +1,25 @@
+{
+  "mode": "kernel",
+  "passed": true,
+  "checks": [
+    {
+      "name": "T1 pingall (8 hosts, 56 pairs)",
+      "ok": true,
+      "detail": "0.0% loss",
+      "result": "PASS"
+    },
+    {
+      "name": "T2 firewall",
+      "ok": null,
+      "detail": "kernel has no firewall",
+      "result": "SKIP"
+    },
+    {
+      "name": "T3 load balancer",
+      "ok": null,
+      "detail": "kernel has no load balancer",
+      "result": "SKIP"
+    }
+  ],
+  "data": {}
+}

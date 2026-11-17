@@ -269,15 +269,93 @@ class _DataPlaneCases:
         self.assertEqual(self.run_packet(P.build(C1, backend, 42010, 80, tcp_flags=0x10))[0],
                          self.DROP, "direct client -> backend traffic stays blocked")
 
-    def test_rules_see_the_client_view_of_load_balanced_replies(self):
+    def test_client_backend_rule_does_not_affect_vip_traffic(self):
         self.add_service(backends=[S3])
-        # a client<->backend rule does not affect VIP traffic in either direction ...
         self.dp.firewall.add(FirewallRule(src=C1, dst=S3, bidir=True))
         self.assertEqual(self.backend_for(42020), S3)
         self.assertEqual(self.run_packet(P.build(S3, C1, 80, 42020, tcp_flags=0x12))[0], self.PASS)
-        # ... while a rule against the VIP blocks its replies too
-        self.dp.firewall.add(FirewallRule(src=VIP, dst=C1))
-        self.assertEqual(self.run_packet(P.build(S3, C1, 80, 42020, tcp_flags=0x10))[0], self.DROP)
+
+    def test_one_vip_rule_covers_both_directions_without_conntrack(self):
+        """Replies are judged in the client->VIP orientation, so a service-port
+        ALLOW rule admits them even with connection tracking disabled."""
+        self.add_service(backends=[S1])
+        self.dp.config.apply(default_action="drop", stateful=False)
+        self.dp.firewall.add(FirewallRule(dst=VIP, proto="tcp", dport=80, action="allow"))
+        self.assertEqual(self.backend_for(42030), S1)
+        self.assertEqual(self.run_packet(P.build(S1, C1, 80, 42030, tcp_flags=0x12))[0], self.PASS)
+
+    def test_reply_not_dropped_by_broader_rule_on_the_client(self):
+        self.add_service(backends=[S1])
+        self.dp.firewall.add(FirewallRule(dst=C1))  # "nothing may reach c1"
+        self.assertEqual(self.backend_for(42040), S1)
+        self.assertEqual(self.run_packet(P.build(S1, C1, 80, 42040, tcp_flags=0x12))[0], self.PASS,
+                         "the reply belongs to c1 -> VIP, which the rule does not match")
+        self.assertEqual(self.run_packet(P.build(S2, C1, 22, 42041))[0], self.DROP)
+
+    def test_vip_drop_rule_blocks_both_directions(self):
+        self.add_service(backends=[S1])
+        self.assertEqual(self.backend_for(42050), S1)
+        self.dp.firewall.add(FirewallRule(src=C1, dst=VIP))
+        self.assertEqual(self.run_packet(P.build(C1, VIP, 42050, 80, tcp_flags=0x10))[0], self.DROP)
+        self.assertEqual(self.run_packet(P.build(S1, C1, 80, 42050, tcp_flags=0x10))[0], self.DROP)
+
+    # ---- state recovery and isolation (review round 2) ----
+    def test_forward_entry_recovered_while_draining(self):
+        """A lost forward entry is rebuilt from the reverse entry, so the connection
+        stays on its (draining) backend instead of being re-hashed."""
+        self.add_service()
+        backend = self.backend_for(43000)
+        self.dp.lb.set_backend_state(VIP, 80, backend, up=False)
+        self.dp.maps["lb_conntrack"].delete(flow_key(C1, VIP, 43000, 80, 6))
+        before = self.counter("lb_recovered")
+        self.assertEqual(self.backend_for(43000, flags=0x10), backend)
+        self.assertEqual(self.counter("lb_recovered"), before + 1)
+
+    def test_reverse_entry_recovered_on_reply(self):
+        self.add_service()
+        backend = self.backend_for(43010)
+        rk = flow_key(backend, C1, 80, 43010, 6)
+        self.dp.maps["lb_reverse"].delete(rk)
+        verdict, out = self.run_packet(P.build(backend, C1, 80, 43010, tcp_flags=0x10))
+        self.assertEqual(verdict, self.PASS)
+        self.assertEqual(P.parse(out).src_ip, VIP, "still SNATed: no backend address leak")
+        self.assertIsNotNone(self.dp.maps["lb_reverse"].lookup(rk))
+
+    def test_backend_reply_without_any_state_is_isolated(self):
+        self.add_service()
+        before = self.counter("drop_isolation")
+        verdict, _ = self.run_packet(P.build(S2, C1, 80, 43020, tcp_flags=0x10))
+        self.assertEqual(verdict, self.DROP, "never forwarded with the backend's real address")
+        self.assertEqual(self.counter("drop_isolation"), before + 1)
+
+    def test_backend_service_endpoint_reachable_only_through_vip(self):
+        self.add_service()
+        self.assertEqual(self.run_packet(P.build(C1, S1, 43030, 80))[0], self.DROP)
+        self.assertEqual(self.run_packet(P.build(C1, S1, 43030, 22))[0], self.PASS)
+
+    def test_drained_backend_share_spreads_evenly(self):
+        """Selection hashes into the list of active backends: draining one of four
+        gives each remaining backend about one third of new connections."""
+        self.add_service()
+        self.dp.lb.set_backend_state(VIP, 80, S1, up=False)
+        counts = {}
+        n = 3000
+        for i in range(n):
+            client = f"10.0.{1 + i % 50}.{1 + (i // 50) % 250}"
+            b = P.parse(self.run_packet(P.build(client, VIP, 20000 + i, 80))[1]).dst_ip
+            counts[b] = counts.get(b, 0) + 1
+        self.assertNotIn(S1, counts)
+        expected = n / 3
+        chi2 = sum((c - expected) ** 2 / expected for c in counts.values())
+        self.assertLess(chi2, 13.82, f"chi2={chi2:.2f} (df=2, p<0.001 critical value) {counts}")
+
+    def test_fragments_are_not_load_balanced(self):
+        """Every fragment, including the first, is port-less: no partial NAT."""
+        self.add_service()
+        frame = P.build(C1, VIP, 43040, 80, frag_field=0x2000)  # MF set, offset 0
+        self.run_packet(frame)
+        self.assertIsNone(self.dp.maps["lb_conntrack"].lookup(flow_key(C1, VIP, 43040, 80, 6)))
+
 
     def test_mac_rule_applies_to_non_ip_frames(self):
         self.dp.firewall.add(FirewallRule(src_mac="00:00:00:00:01:01"))
@@ -306,6 +384,48 @@ class _DataPlaneCases:
                  if (f["src"], f.get("sport")) == (C2, 45000)]
         self.assertEqual(len(flows), 1)
         self.assertGreaterEqual(flows[0]["packets"], 4)
+
+
+CHAIN = ["xdp_chain_fw", "xdp_chain_lb", "xdp_chain_out"]
+
+
+@unittest.skipIf(_skip_reason(), _skip_reason())
+class ChainAblationTest(unittest.TestCase):
+    """The tail-call chained variant (used only for the ablation benchmark) must
+    behave exactly like the single program."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pin_dir = f"/sys/fs/bpf/sdn_test_chain_{os.getpid()}"
+        build()
+        cls.obj = LoadedObject("xdp", pin_dir=cls.pin_dir, programs=["xdp_dataplane", *CHAIN])
+        cls.obj.fill_prog_array("chain_progs", CHAIN)
+        cls.dp = DataPlane.open(cls.pin_dir)
+        cls.dp.config.apply(default_action="allow", stateful=True)
+        cls.dp.lb.add_service(VIP, 80, BACKENDS)
+        cls.dp.firewall.add(FirewallRule(src=C1, dst=S3, proto="tcp", dport=22))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.obj.close()
+        for m in cls.dp.maps.values():
+            m.close()
+        unpin_maps(cls.pin_dir)
+
+    def test_same_verdicts_and_packets(self):
+        backend = P.parse(self.obj.test_run(P.build(C1, VIP, 44000, 80))[1]).dst_ip
+        frames = {
+            "pass": P.build(C1, S2, 44001, 22),
+            "drop": P.build(C1, S3, 44002, 22),
+            "dnat": P.build(C1, VIP, 44000, 80, tcp_flags=0x10),
+            "snat": P.build(backend, C1, 80, 44000, tcp_flags=0x10),
+            "isolate": P.build(S2, C1, 80, 44999, tcp_flags=0x10),
+        }
+        for name, frame in frames.items():
+            with self.subTest(path=name):
+                mono = self.obj.test_run(frame)[:2]
+                chain = self.obj.test_run(frame, program="xdp_chain_fw")[:2]
+                self.assertEqual(chain, mono)
 
 
 @unittest.skipIf(_skip_reason(), _skip_reason())

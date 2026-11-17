@@ -17,6 +17,9 @@ PYTHON = sys.executable
 
 CLIENT_GW, SERVER_GW = "10.0.1.254", "10.0.2.254"
 VIP, VPORT = "10.100.0.1", 80
+# Benchmark service: iperf3 through the load balancer. A single backend keeps
+# iperf3's control and data connections on the same server.
+BENCH_VIP, BENCH_PORT = "10.100.0.2", 5202
 OVS_GW_MAC = "02:00:00:00:00:fe"
 API_LISTEN = "127.0.0.1:8080"
 

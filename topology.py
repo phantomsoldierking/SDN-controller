@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from testbed import benchmark, scenarios  # noqa: E402
 from testbed.backends import BackendServers  # noqa: E402
-from testbed.config import SERVERS, VIP, VPORT  # noqa: E402
+from testbed.config import BENCH_PORT, BENCH_VIP, SERVERS, VIP, VPORT, host  # noqa: E402
 from testbed.gateways import Unsupported, make_gateway  # noqa: E402
 from testbed.net import build_network  # noqa: E402
 from testbed.report import Report  # noqa: E402
@@ -74,6 +74,12 @@ def run(a, net, gw, report: Report, workdir: str) -> None:
     else:
         try:  # make the VIP usable for Test 4 and interactive use
             gw.add_service(VIP, VPORT, SERVERS)
+        except Unsupported:
+            pass
+    if "4" in a.tests:
+        try:  # iperf3 through the load balancer (one backend, TCP and UDP)
+            for proto in ("tcp", "udp"):
+                gw.add_service(BENCH_VIP, BENCH_PORT, [host("s2")], proto)
         except Unsupported:
             pass
     if "4" in a.tests:

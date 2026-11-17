@@ -22,33 +22,53 @@ static __always_inline __u32 fw_hit(struct fw_key *k)
 	return r->action;
 }
 
+/* Patterns with no installed rule are skipped (Tuple Space Search probes only
+ * populated tuples). Without a configuration every pattern is probed. */
+static __always_inline int fw_populated(__u32 mask, __u8 pattern)
+{
+	return (mask >> pattern) & 1;
+}
+
+static __always_inline __u32 fw_pattern_mask(const struct dp_config *cfg)
+{
+	return cfg ? cfg->pattern_mask : 0xFFFFFFFF;
+}
+
 /* L2 rules (patterns 1-2); applied to every Ethernet frame, IP or not. */
-static __always_inline __u32 fw_mac_lookup(const struct ethhdr *eth)
+static __always_inline __u32 fw_mac_lookup(const struct ethhdr *eth, __u32 mask)
 {
 	struct fw_key k;
 	__u32 a;
 
+	if (!fw_populated(mask, FW_M_MAC_PAIR) && !fw_populated(mask, FW_M_MAC_SRC))
+		return ACT_NONE;
 	__builtin_memset(&k, 0, sizeof(k));
 	k.kind = FW_KIND_MAC;
-	k.mask = FW_M_MAC_PAIR;
 	__builtin_memcpy(k.smac, eth->h_source, ETH_ALEN);
-	__builtin_memcpy(k.dmac, eth->h_dest, ETH_ALEN);
-	a = fw_hit(&k);
-	if (a != ACT_NONE)
-		return a;
+	if (fw_populated(mask, FW_M_MAC_PAIR)) {
+		k.mask = FW_M_MAC_PAIR;
+		__builtin_memcpy(k.dmac, eth->h_dest, ETH_ALEN);
+		a = fw_hit(&k);
+		if (a != ACT_NONE)
+			return a;
+		__builtin_memset(k.dmac, 0, ETH_ALEN);
+	}
+	if (!fw_populated(mask, FW_M_MAC_SRC))
+		return ACT_NONE;
 	k.mask = FW_M_MAC_SRC;
-	__builtin_memset(k.dmac, 0, ETH_ALEN);
 	return fw_hit(&k);
 }
 
 static __always_inline __u32 fw_ip_try(struct fw_key *k, __u8 mask, const struct flow_key *f,
-				       __u32 fields)
+				       __u32 fields, __u32 populated)
 {
 #define F_S (1U << 0)
 #define F_D (1U << 1)
 #define F_SP (1U << 2)
 #define F_DP (1U << 3)
 #define F_P (1U << 4)
+	if (!fw_populated(populated, mask))
+		return ACT_NONE;
 	k->mask = mask;
 	k->saddr = (fields & F_S) ? f->saddr : 0;
 	k->daddr = (fields & F_D) ? f->daddr : 0;
@@ -63,7 +83,7 @@ static __always_inline __u32 fw_ip_try(struct fw_key *k, __u8 mask, const struct
  * `f` is the client-visible flow key (see pipeline.h). Port patterns only
  * apply when the packet has ports (TCP/UDP, not a non-first fragment).
  */
-static __always_inline __u32 fw_ip_lookup(const struct flow_key *f, int has_ports)
+static __always_inline __u32 fw_ip_lookup(const struct flow_key *f, int has_ports, __u32 m)
 {
 	struct fw_key k;
 	__u32 a;
@@ -71,22 +91,22 @@ static __always_inline __u32 fw_ip_lookup(const struct flow_key *f, int has_port
 	__builtin_memset(&k, 0, sizeof(k));
 	k.kind = FW_KIND_IP;
 	if (has_ports) {
-		if ((a = fw_ip_try(&k, FW_M_IP_EXACT, f, F_S | F_D | F_SP | F_DP | F_P)))
+		if ((a = fw_ip_try(&k, FW_M_IP_EXACT, f, F_S | F_D | F_SP | F_DP | F_P, m)))
 			return a;
-		if ((a = fw_ip_try(&k, FW_M_IP_DPORT, f, F_S | F_D | F_DP | F_P)))
+		if ((a = fw_ip_try(&k, FW_M_IP_DPORT, f, F_S | F_D | F_DP | F_P, m)))
 			return a;
-		if ((a = fw_ip_try(&k, FW_M_IP_SPORT, f, F_S | F_D | F_SP | F_P)))
+		if ((a = fw_ip_try(&k, FW_M_IP_SPORT, f, F_S | F_D | F_SP | F_P, m)))
 			return a;
 	}
-	if ((a = fw_ip_try(&k, FW_M_IP_PROTO, f, F_S | F_D | F_P)))
+	if ((a = fw_ip_try(&k, FW_M_IP_PROTO, f, F_S | F_D | F_P, m)))
 		return a;
-	if ((a = fw_ip_try(&k, FW_M_IP_PAIR, f, F_S | F_D)))
+	if ((a = fw_ip_try(&k, FW_M_IP_PAIR, f, F_S | F_D, m)))
 		return a;
-	if (has_ports && (a = fw_ip_try(&k, FW_M_SVC_PORT, f, F_D | F_DP | F_P)))
+	if (has_ports && (a = fw_ip_try(&k, FW_M_SVC_PORT, f, F_D | F_DP | F_P, m)))
 		return a;
-	if ((a = fw_ip_try(&k, FW_M_IP_SRC, f, F_S)))
+	if ((a = fw_ip_try(&k, FW_M_IP_SRC, f, F_S, m)))
 		return a;
-	return fw_ip_try(&k, FW_M_IP_DST, f, F_D);
+	return fw_ip_try(&k, FW_M_IP_DST, f, F_D, m);
 #undef F_S
 #undef F_D
 #undef F_SP
@@ -94,12 +114,15 @@ static __always_inline __u32 fw_ip_lookup(const struct flow_key *f, int has_port
 #undef F_P
 }
 
-/* Record or refresh an admitted flow. A reply refreshes the original entry
- * (and marks it REPLY) instead of creating a second one. */
-static __always_inline void ct_touch(const struct flow_key *k, struct pkt *p, __u64 now)
+/* Record or refresh an admitted flow under key k. A reply refreshes the
+ * original entry (and marks it REPLY) instead of creating a second one;
+ * `is_reply` marks load-balanced replies, whose k is already the client->VIP
+ * orientation. */
+static __always_inline void ct_touch(const struct flow_key *k, struct pkt *p, __u64 now,
+				     int is_reply)
 {
 	struct ct_entry *ct = bpf_map_lookup_elem(&fw_conntrack, k);
-	__u32 extra = 0;
+	__u32 extra = is_reply ? CT_F_REPLY : 0;
 
 	if (!ct) {
 		struct flow_key rk;
@@ -138,13 +161,13 @@ static __always_inline int ct_established(const struct flow_key *k)
 }
 
 /*
- * Admission decision for an IPv4 packet with client-visible key `f`
- * (Eq. 4 of the paper). Returns 1 if the packet must be dropped.
+ * Admission decision for an IPv4 packet with rule key `f` (Eq. 5 of the
+ * paper). Returns 1 if the packet must be dropped.
  */
 static __always_inline int firewall_ip(const struct flow_key *f, int has_ports,
 				       struct dp_config *cfg)
 {
-	__u32 action = fw_ip_lookup(f, has_ports);
+	__u32 action = fw_ip_lookup(f, has_ports, fw_pattern_mask(cfg));
 	int stateful = cfg && (cfg->flags & CFG_F_FW_STATEFUL);
 
 	if (action == ACT_DROP)

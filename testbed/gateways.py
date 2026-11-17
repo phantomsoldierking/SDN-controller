@@ -20,8 +20,10 @@ import subprocess
 import tempfile
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 
 from .config import API_LISTEN, CONTROL_PLANE, HOSTS, OVS_GW_MAC, PYTHON, Host
+from .cpus import AUX_CPUS
 from .net import disable_tx_offload, sh
 
 log = logging.getLogger("testbed")
@@ -31,6 +33,16 @@ class Unsupported(Exception):
     """The gateway implementation cannot do this (the test is skipped)."""
 
 
+@dataclass
+class Service:
+    vip: str
+    port: int
+    proto: str
+    backends: list[Host]
+    group_id: int = 0
+    active: set[str] = field(default_factory=set)
+
+
 class Gateway(ABC):
     label = ""
     has_load_balancer = False
@@ -38,6 +50,17 @@ class Gateway(ABC):
     def __init__(self, net):
         self.net = net
         self.node = net.get("gw")
+        self.services: dict[tuple[str, int, str], Service] = {}
+
+    def _register(self, vip, port, backends, proto) -> Service | None:
+        """Record a service; None if it already exists (add_service is idempotent)."""
+        key = (vip, port, proto)
+        if key in self.services:
+            return None
+        svc = Service(vip, port, proto, list(backends), len(self.services) + 1,
+                      {b.name for b in backends})
+        self.services[key] = svc
+        return svc
 
     @abstractmethod
     def start(self) -> None: ...
@@ -54,17 +77,18 @@ class Gateway(ABC):
                 bidir: bool = True) -> None:
         raise Unsupported(f"{self.label} has no firewall")
 
-    def add_service(self, vip: str, port: int, backends: list[Host]) -> None:
+    def add_service(self, vip: str, port: int, backends: list[Host], proto: str = "tcp") -> None:
         raise Unsupported(f"{self.label} has no load balancer")
 
-    def set_backend(self, vip: str, port: int, backend: Host, up: bool) -> None:
+    def set_backend(self, vip: str, port: int, backend: Host, up: bool,
+                    proto: str = "tcp") -> None:
         raise Unsupported(f"{self.label} cannot drain backends")
 
     def drop_count(self) -> int:
         raise Unsupported(f"{self.label} has no in-kernel drop counter")
 
-    def lb_connections(self) -> int:
-        """Number of tracked load-balanced connections."""
+    def lb_connections(self, vip: str, port: int) -> int:
+        """Number of tracked load-balanced connections of a TCP service."""
         raise Unsupported(f"{self.label} has no connection tracking")
 
     def report(self) -> str:
@@ -117,10 +141,12 @@ class EbpfGateway(KernelGateway):
         print(self._cp(f"load --hook {self.hook} --xdp-mode {self.xdp_mode} "
                        f"{'--fib-forward ' if self.fib_forward else ''}{self._iface_args()}")
               .rstrip())
+        affinity = ["taskset", "-c", AUX_CPUS] if AUX_CPUS else []
         with open(self.log_path, "w") as logf:
             self._daemon = self.node.popen(
-                [PYTHON, CONTROL_PLANE, "daemon", "--api", API_LISTEN, "--idle-timeout", "30",
-                 "--fin-timeout", "5", "--gc-interval", "2"], stdout=logf, stderr=subprocess.STDOUT)
+                affinity + [PYTHON, CONTROL_PLANE, "daemon", "--api", API_LISTEN,
+                            "--idle-timeout", "30", "--fin-timeout", "5", "--gc-interval", "2"],
+                stdout=logf, stderr=subprocess.STDOUT)
         for _ in range(50):
             if '"rx_packets"' in self.node.cmd(f"curl -s http://{API_LISTEN}/stats"):
                 print(f"*** control-plane daemon up (REST http://{API_LISTEN}, log {self.log_path})")
@@ -158,21 +184,26 @@ class EbpfGateway(KernelGateway):
     def unblock(self, src, dst, proto="any", dport=0, bidir=True) -> None:
         self.rest("DELETE", "/firewall", self._rule(src, dst, proto, dport, bidir))
 
-    def add_service(self, vip, port, backends) -> None:
-        body = {"vip": vip, "port": port, "proto": "tcp",
+    def add_service(self, vip, port, backends, proto="tcp") -> None:
+        if not self._register(vip, port, backends, proto):
+            return
+        body = {"vip": vip, "port": port, "proto": proto,
                 "backends": [f"{b.ip}:{port}" for b in backends]}
-        print(f"    REST POST /services -> {self.rest('POST', '/services', body)}")
+        print(f"    REST POST /services {vip}:{port}/{proto} -> "
+              f"{self.rest('POST', '/services', body)}")
 
-    def set_backend(self, vip, port, backend, up) -> None:
+    def set_backend(self, vip, port, backend, up, proto="tcp") -> None:
         self.rest("PUT", "/services/backend", {"vip": vip, "port": port, "backend": backend.ip,
-                                               "state": "up" if up else "down"})
+                                               "proto": proto, "state": "up" if up else "down"})
 
     def drop_count(self) -> int:
         return self.rest("GET", "/stats")["drop_firewall"]
 
-    def lb_connections(self) -> int:
+    def lb_connections(self, vip, port) -> int:
         tables = self.rest("GET", "/conntrack")
-        return min(len(tables["lb"]), len(tables["lb_reverse"]))
+        fwd = [e for e in tables["lb"] if (e["dst"], e["dport"]) == (vip, port)]
+        rev = [e for e in tables["lb_reverse"] if e["vip"] == f"{vip}:{port}"]
+        return min(len(fwd), len(rev))
 
     def report(self) -> str:
         return self._cp("stats --top 10")
@@ -226,23 +257,28 @@ class NetfilterGateway(KernelGateway):
         m = re.search(r"packets (\d+)", self._sh("nft list counter inet sdn fwdrop"))
         return int(m.group(1)) if m else 0
 
-    def add_service(self, vip, port, backends) -> None:
-        if getattr(self, "_service", None):
+    @staticmethod
+    def _flag(proto: str) -> str:
+        return "-u" if proto == "udp" else "-t"
+
+    def add_service(self, vip, port, backends, proto="tcp") -> None:
+        if not self._register(vip, port, backends, proto):
             return
-        self._sh(f"ip addr add {vip}/32 dev lo")  # IPVS serves VIPs that are local
-        if not sh(self.node, f"ipvsadm -A -t {vip}:{port} -s mh -b mh-fallback,mh-port").strip() == "":
-            self._sh(f"ipvsadm -A -t {vip}:{port} -s rr")  # kernel without ip_vs_mh
+        self._sh(f"ip addr replace {vip}/32 dev lo")  # IPVS serves VIPs that are local
+        svc = f"{self._flag(proto)} {vip}:{port}"
+        if sh(self.node, f"ipvsadm -A {svc} -s mh -b mh-fallback,mh-port").strip():
+            self._sh(f"ipvsadm -A {svc} -s rr")  # kernel without ip_vs_mh
         for b in backends:
-            self._sh(f"ipvsadm -a -t {vip}:{port} -r {b.ip}:{port} -m -w 1")
-        self._service = (vip, port)
+            self._sh(f"ipvsadm -a {svc} -r {b.ip}:{port} -m -w 1")
 
-    def set_backend(self, vip, port, backend, up) -> None:
+    def set_backend(self, vip, port, backend, up, proto="tcp") -> None:
         # weight 0: no new connections; existing ones continue (graceful drain)
-        self._sh(f"ipvsadm -e -t {vip}:{port} -r {backend.ip}:{port} -m -w {1 if up else 0}")
+        self._sh(f"ipvsadm -e {self._flag(proto)} {vip}:{port} -r {backend.ip}:{port} -m "
+                 f"-w {1 if up else 0}")
 
-    def lb_connections(self) -> int:
-        vip, port = self._service
-        return sum(1 for line in self._sh("ipvsadm -Lnc").splitlines() if f"{vip}:{port}" in line)
+    def lb_connections(self, vip, port) -> int:
+        return sum(1 for line in self._sh("ipvsadm -Lnc").splitlines()
+                   if line.startswith("TCP") and f"{vip}:{port}" in line)
 
     def stop(self) -> None:
         self.node.cmd("ipvsadm -C; nft delete table inet sdn")
@@ -291,8 +327,6 @@ class OvsGateway(Gateway):
             flows.append(f"table=0,priority=100,arp,arp_tpa={h.ip},actions=output:{h.port}")
             flows.append(self._route(h))
         self._add_flows(*flows)
-        self._pool: list[Host] = []
-        self._active: set[str] = set()
 
     def _acl(self, src, dst, proto, dport, bidir) -> list[str]:
         match = "ip" if proto == "any" else proto
@@ -315,34 +349,36 @@ class OvsGateway(Gateway):
                    if f"priority={self.ACL_PRIORITY}," in line and "actions=drop" in line
                    for m in [re.search(r"n_packets=(\d+)", line)] if m)
 
-    def _bucket(self, b: Host, port: int) -> str:
+    def _bucket(self, b: Host, svc: Service) -> str:
         return (f"bucket=set_field:{b.ip}->ip_dst,set_field:{OVS_GW_MAC}->eth_src,"
                 f"set_field:{b.mac}->eth_dst,dec_ttl,output:{b.port}")
 
-    def _write_group(self, port: int, command: str) -> None:
-        buckets = ",".join(self._bucket(b, port) for b in self._pool if b.name in self._active)
-        self._ofctl(f"{command} gw {shlex.quote(f'group_id=1,type=select,{buckets}')}")
+    def _write_group(self, svc: Service, command: str) -> None:
+        buckets = ",".join(self._bucket(b, svc) for b in svc.backends if b.name in svc.active)
+        group = f"group_id={svc.group_id},type=select,{buckets}"
+        self._ofctl(f"{command} gw {shlex.quote(group)}")
 
-    def _service_flows(self, vip: str, port: int) -> list[str]:
+    def _service_flows(self, svc: Service) -> list[str]:
         # No conntrack in OpenFlow 1.3, so the reverse NAT is stateless:
         # every reply from a backend's service port to a client is rewritten.
-        return [f"table=0,priority=300,tcp,nw_dst={vip},tp_dst={port},actions=group:1",
-                *(f"table=0,priority=300,tcp,nw_src={b.ip},tp_src={port},"
-                  f"nw_dst=10.0.1.0/24,actions=set_field:{vip}->ip_src,goto_table:1"
-                  for b in self._pool)]
+        return [f"table=0,priority=300,{svc.proto},nw_dst={svc.vip},tp_dst={svc.port},"
+                f"actions=group:{svc.group_id}",
+                *(f"table=0,priority=300,{svc.proto},nw_src={b.ip},tp_src={svc.port},"
+                  f"nw_dst=10.0.1.0/24,actions=set_field:{svc.vip}->ip_src,goto_table:1"
+                  for b in svc.backends)]
 
-    def add_service(self, vip, port, backends) -> None:
-        if self._pool:
-            return
-        self._pool, self._active, self._vip = list(backends), {b.name for b in backends}, vip
-        self._write_group(port, "add-group")
-        self._add_flows(*self._service_flows(vip, port))
+    def add_service(self, vip, port, backends, proto="tcp") -> None:
+        svc = self._register(vip, port, backends, proto)
+        if svc:
+            self._write_group(svc, "add-group")
+            self._add_flows(*self._service_flows(svc))
 
-    def set_backend(self, vip, port, backend, up) -> None:
+    def set_backend(self, vip, port, backend, up, proto="tcp") -> None:
         """Remove (or restore) the backend's bucket. Without conntrack, flows that
         hashed to it are re-hashed; with conntrack (OvsCtGateway) they continue."""
-        (self._active.add if up else self._active.discard)(backend.name)
-        self._write_group(port, "mod-group")
+        svc = self.services[(vip, port, proto)]
+        (svc.active.add if up else svc.active.discard)(backend.name)
+        self._write_group(svc, "mod-group")
 
 
 class OvsCtGateway(OvsGateway):
@@ -363,16 +399,17 @@ class OvsCtGateway(OvsGateway):
                 "table=1,priority=100,ct_state=+trk+rel,ip,actions=goto_table:2",
                 "table=1,priority=0,actions=drop"]
 
-    def _bucket(self, b: Host, port: int) -> str:
-        return f"bucket=ct(commit,table=2,nat(dst={b.ip}:{port}))"
+    def _bucket(self, b: Host, svc: Service) -> str:
+        return f"bucket=ct(commit,table=2,nat(dst={b.ip}:{svc.port}))"
 
-    def _service_flows(self, vip: str, port: int) -> list[str]:
-        return [f"table=1,priority=200,ct_state=+trk+new,tcp,nw_dst={vip},tp_dst={port},"
-                "actions=group:1"]
+    def _service_flows(self, svc: Service) -> list[str]:
+        return [f"table=1,priority=200,ct_state=+trk+new,{svc.proto},nw_dst={svc.vip},"
+                f"tp_dst={svc.port},actions=group:{svc.group_id}"]
 
-    def lb_connections(self) -> int:
+    def lb_connections(self, vip, port) -> int:
         out = self.node.cmd("ovs-appctl dpctl/dump-conntrack")
-        return sum(1 for line in out.splitlines() if f"dst={self._vip}," in line and "tcp" in line)
+        return sum(1 for line in out.splitlines()
+                   if line.startswith("tcp") and f"dst={vip}," in line and f"dport={port})" in line)
 
 
 def make_gateway(net, mode: str, hook: str = "xdp", xdp_mode: str = "auto",

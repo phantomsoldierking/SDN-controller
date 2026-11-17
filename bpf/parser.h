@@ -76,7 +76,10 @@ static __always_inline int parse_packet(void *data, void *data_end, struct pkt *
 	p->key.proto = iph->protocol;
 
 	/* Non-first fragments carry no L4 header. */
-	if (iph->frag_off & bpf_htons(IP_OFFSET))
+	/* No reassembly: every fragment, including the first one (MF set,
+	 * offset 0), is treated as port-less, so all fragments of a datagram
+	 * share one key and none of them is load-balanced or NAT-rewritten. */
+	if (iph->frag_off & bpf_htons(IP_OFFSET | IP_MF))
 		return PARSE_OK;
 
 	void *l4 = (void *)iph + ihl_len;

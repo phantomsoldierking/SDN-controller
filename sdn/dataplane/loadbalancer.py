@@ -9,7 +9,8 @@ from __future__ import annotations
 import ctypes as ct
 import threading
 
-from ..abi import MAX_BACKENDS_PER_SVC, MAX_SERVICES, Backend, SvcInfo, SvcKey
+from ..abi import (MAX_BACKENDS_PER_SVC, MAX_SERVICES, Backend, EndpointInfo, EndpointKey,
+                   SvcInfo, SvcKey)
 from ..codec import (ip_to_wire, parse_endpoint, parse_proto, port_to_wire, proto_name,
                      wire_to_ip, wire_to_port)
 from ..maps import MapBackend
@@ -24,8 +25,20 @@ def _service_key(vip: str, port: int, proto: str) -> SvcKey:
 
 
 class LoadBalancer:
+    """Services own three structures in the data plane:
+
+    lb_backends   slot id*16+i: the pool (address, port, drain flag)
+    lb_active     slot id*16+k: indices of the active backends, k < n_act; new
+                  connections pick lb_active[h mod n_act], so drained backends
+                  get none and the active ones share them uniformly
+    lb_endpoints  (address, port, proto) -> service: lets a reply rebuild lost
+                  state, and isolates backend endpoints from direct access
+    """
+
     def __init__(self, maps: dict[str, MapBackend], lock: threading.RLock):
-        self._services, self._backends, self._lock = maps["lb_services"], maps["lb_backends"], lock
+        self._services, self._backends = maps["lb_services"], maps["lb_backends"]
+        self._active, self._endpoints = maps["lb_active"], maps["lb_endpoints"]
+        self._lock = lock
 
     def add_service(self, vip: str, port: int, backends: list[str], proto: str = "tcp") -> int:
         """Create or replace a service. Backends are 'ip' or 'ip:port'."""
@@ -34,34 +47,52 @@ class LoadBalancer:
         endpoints = [parse_endpoint(b, port) for b in backends]
         key = _service_key(vip, port, proto)
         with self._lock:
-            self._check_disjoint(key, endpoints, parse_proto(proto))
+            self._check_disjoint(key, endpoints)
             existing = self._services.lookup(key)
             svc_id = existing.id if existing is not None else self._free_id()
+            if existing is not None:
+                self._remove_endpoints(svc_id, existing.count, key.proto)
+            pool = []
             for i in range(MAX_BACKENDS_PER_SVC):
                 if i < len(endpoints):
                     ip, bport = endpoints[i]
                     be = Backend(ip=ip_to_wire(ip), port=port_to_wire(bport), active=1)
+                    pool.append(be)
+                    self._endpoints.update(
+                        EndpointKey(ip=be.ip, port=be.port, proto=key.proto),
+                        EndpointInfo(vip=key.vip, vport=key.port, svc_id=svc_id, be_idx=i))
                 else:
                     be = Backend()
                 self._backends.update(_slot(svc_id, i), be)
-            self._services.update(key, SvcInfo(id=svc_id, count=len(endpoints)))
+            # Publish the active list before the service entry, so the data plane
+            # never sees a service whose pool is not populated yet.
+            n_act = self._write_active(svc_id, pool)
+            self._services.update(key, SvcInfo(id=svc_id, count=len(pool), active=n_act))
         return svc_id
 
-    def _check_disjoint(self, key: SvcKey, endpoints: list[tuple[str, int]], proto: int) -> None:
-        """Reverse-NAT entries are keyed by the backend's reply 5-tuple, which does
-        not contain the VIP. Two services sharing a backend endpoint could
-        therefore produce the same reverse key, so endpoints must be disjoint."""
-        wanted = {(ip_to_wire(ip), port_to_wire(p)) for ip, p in endpoints}
-        for other_key, info in self._services.items():
-            if bytes(other_key) == bytes(key) or other_key.proto != proto:
-                continue
-            for i in range(info.count):
-                be = self._backends.lookup(_slot(info.id, i))
-                if be is not None and (be.ip, be.port) in wanted:
-                    raise ValueError(
-                        f"backend {wire_to_ip(be.ip)}:{wire_to_port(be.port)} already serves "
-                        f"{wire_to_ip(other_key.vip)}:{wire_to_port(other_key.port)}; "
-                        "backend endpoints must be disjoint across services")
+    def _write_active(self, svc_id: int, pool: list[Backend]) -> int:
+        active = [i for i, be in enumerate(pool) if be.active and be.ip]
+        for k, idx in enumerate(active):
+            self._active.update(_slot(svc_id, k), ct.c_uint32(idx))
+        return len(active)
+
+    def _check_disjoint(self, key: SvcKey, endpoints: list[tuple[str, int]]) -> None:
+        """Reverse-NAT keys are reply 5-tuples, which do not contain the VIP, so a
+        backend endpoint (address, port, protocol) may serve only one service."""
+        for ip, port in endpoints:
+            ek = EndpointKey(ip=ip_to_wire(ip), port=port_to_wire(port), proto=key.proto)
+            owner = self._endpoints.lookup(ek)
+            if owner is not None and (owner.vip, owner.vport) != (key.vip, key.port):
+                raise ValueError(
+                    f"backend {ip}:{port}/{proto_name(key.proto)} already serves "
+                    f"{wire_to_ip(owner.vip)}:{wire_to_port(owner.vport)}; backend "
+                    "endpoints must be disjoint across services")
+
+    def _remove_endpoints(self, svc_id: int, count: int, proto: int) -> None:
+        for i in range(count):
+            be = self._backends.lookup(_slot(svc_id, i))
+            if be is not None and be.ip:
+                self._endpoints.delete(EndpointKey(ip=be.ip, port=be.port, proto=proto))
 
     def _free_id(self) -> int:
         used = {info.id for _, info in self._services.items()}
@@ -77,6 +108,7 @@ class LoadBalancer:
             if info is None:
                 return False
             self._services.delete(key)
+            self._remove_endpoints(info.id, info.count, key.proto)
             for i in range(MAX_BACKENDS_PER_SVC):
                 self._backends.update(_slot(info.id, i), Backend())
         return True
@@ -86,18 +118,22 @@ class LoadBalancer:
         """Drain (up=False) or restore a backend. A drained backend receives no new
         connections; its existing connections continue until they close or expire.
         Returns False if the backend is not in the pool."""
-        info = self._services.lookup(_service_key(vip, port, proto))
+        key = _service_key(vip, port, proto)
+        info = self._services.lookup(key)
         if info is None:
             raise ValueError(f"no service {vip}:{port}/{proto}")
         ip = ip_to_wire(backend.partition(":")[0])
         with self._lock:
-            for i in range(info.count):
-                be = self._backends.lookup(_slot(info.id, i))
-                if be is not None and be.ip == ip:
-                    be.active = 1 if up else 0
-                    self._backends.update(_slot(info.id, i), be)
-                    return True
-        return False
+            pool = [self._backends.lookup(_slot(info.id, i)) for i in range(info.count)]
+            hit = [i for i, be in enumerate(pool) if be is not None and be.ip == ip]
+            if not hit:
+                return False
+            for i in hit:
+                pool[i].active = 1 if up else 0
+                self._backends.update(_slot(info.id, i), pool[i])
+            info.active = self._write_active(info.id, pool)
+            self._services.update(key, info)
+        return True
 
     def list(self) -> list[dict]:
         out = []

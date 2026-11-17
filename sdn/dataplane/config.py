@@ -42,6 +42,13 @@ class ConfigStore:
             self._map.update(_KEY, cfg)
             return cfg
 
+    def set_pattern_mask(self, mask: int) -> None:
+        """Which rule patterns are populated (the data plane skips the others)."""
+        with self._lock:
+            cfg = self.get()
+            cfg.pattern_mask = mask
+            self._map.update(_KEY, cfg)
+
     def describe(self) -> dict:
         cfg = self.get()
         return {"default_action": action_name(cfg.default_action),

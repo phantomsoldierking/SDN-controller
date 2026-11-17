@@ -28,7 +28,8 @@ def _pseudo(src: bytes, dst: bytes, proto: int, length: int) -> bytes:
 
 def build(src_ip, dst_ip, sport, dport, proto=TCP, payload=b"hello",
           src_mac="00:00:00:00:01:01", dst_mac="00:00:00:00:00:fe",
-          tcp_flags=0x02, udp_zero_csum=False) -> bytes:
+          tcp_flags=0x02, udp_zero_csum=False, frag_field=0x4000) -> bytes:
+    """frag_field: IPv4 flags + fragment offset (default DF; 0x2000 = MF, first fragment)."""
     s, d = socket.inet_aton(src_ip), socket.inet_aton(dst_ip)
     if proto == TCP:
         l4 = struct.pack("!HHIIBBHHH", sport, dport, 1, 0, 5 << 4, tcp_flags, 65535, 0, 0) + payload
@@ -39,7 +40,7 @@ def build(src_ip, dst_ip, sport, dport, proto=TCP, payload=b"hello",
         if not udp_zero_csum:
             csum = inet_checksum(_pseudo(s, d, UDP, len(l4)) + l4) or 0xFFFF
             l4 = l4[:6] + struct.pack("!H", csum) + l4[8:]
-    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(l4), 1, 0x4000, 64, proto, 0, s, d)
+    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(l4), 1, frag_field, 64, proto, 0, s, d)
     ip = ip[:10] + struct.pack("!H", inet_checksum(ip)) + ip[12:]
     return mac(dst_mac) + mac(src_mac) + struct.pack("!H", ETH_P_IP) + ip + l4
 

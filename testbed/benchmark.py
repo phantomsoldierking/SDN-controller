@@ -1,7 +1,6 @@
 """Test 4: performance benchmark on the c1 -> gw -> s2 path."""
 from __future__ import annotations
 
-import glob
 import json
 import os
 import re
@@ -9,43 +8,13 @@ import shutil
 import time
 
 from .backends import probe
-from .config import VIP, VPORT, host
+from .config import BENCH_PORT, BENCH_VIP, VIP, VPORT, host
+from .cpus import CLIENT_CPU, SERVER_CPU, pinned
 from .gateways import Gateway, Unsupported
 from .net import host_tool
 from .report import Report
 
 DROP_TEST_PORT = 9999
-
-
-def _pick_cpus() -> tuple[str, str]:
-    """Client and server CPUs for the traffic tools: SDN_CLIENT_CPU / SDN_SERVER_CPU,
-    else the first hardware thread of the two fastest physical cores (on hybrid
-    CPUs these are performance cores). Empty strings disable pinning."""
-    env = os.environ.get("SDN_CLIENT_CPU"), os.environ.get("SDN_SERVER_CPU")
-    if all(env):
-        return env
-    cores: dict[tuple[int, int], tuple[int, int]] = {}
-    for cpu_dir in glob.glob("/sys/devices/system/cpu/cpu[0-9]*"):
-        cpu = int(cpu_dir.rsplit("cpu", 1)[1])
-        try:
-            freq = int(open(f"{cpu_dir}/cpufreq/cpuinfo_max_freq").read())
-            core = (int(open(f"{cpu_dir}/topology/physical_package_id").read()),
-                    int(open(f"{cpu_dir}/topology/core_id").read()))
-        except (OSError, ValueError):
-            continue
-        if core not in cores or cpu < cores[core][1]:
-            cores[core] = (freq, cpu)
-    fastest = sorted(cores.values(), key=lambda fc: (-fc[0], fc[1]))
-    if len(fastest) < 2:
-        return "", ""
-    return str(fastest[0][1]), str(fastest[1][1])
-
-
-CLIENT_CPU, SERVER_CPU = _pick_cpus()
-
-
-def pinned(cpu: str, cmd: str) -> str:
-    return f"taskset -c {cpu} {cmd}" if cpu and shutil.which("taskset") else cmd
 
 
 def _iperf(node, args: str) -> dict:
@@ -56,19 +25,22 @@ def _iperf(node, args: str) -> dict:
         return {}
 
 
-def tcp_throughput(client, server_ip: str, duration: int) -> dict:
-    bps = _iperf(client, f"-c {server_ip} -t {duration}").get("end", {}) \
+def tcp_throughput(client, server_ip: str, duration: int, port: int = 5201,
+                   prefix: str = "") -> dict:
+    bps = _iperf(client, f"-c {server_ip} -p {port} -t {duration}").get("end", {}) \
         .get("sum_received", {}).get("bits_per_second")
-    return {"tcp_gbps": round(bps / 1e9, 3) if bps else None}
+    return {f"tcp{prefix}_gbps": round(bps / 1e9, 3) if bps else None}
 
 
-def udp_small_packets(client, server_ip: str, duration: int) -> dict:
+def udp_small_packets(client, server_ip: str, duration: int, port: int = 5201,
+                      prefix: str = "") -> dict:
     # 22 B payload + 8 UDP + 20 IPv4 + 14 Ethernet = 64-byte frames
-    s = _iperf(client, f"-c {server_ip} -u -b 0 -l 22 -t {duration}").get("end", {}).get("sum", {})
+    s = _iperf(client, f"-c {server_ip} -p {port} -u -b 0 -l 22 -t {duration}") \
+        .get("end", {}).get("sum", {})
     received = s.get("packets", 0) - s.get("lost_packets", 0)
     seconds = s.get("seconds") or duration
-    return {"udp64_rx_pps": int(received / seconds) if received > 0 else None,
-            "udp64_loss_pct": round(s.get("lost_percent", 0), 2) if s else None}
+    return {f"udp64{prefix}_rx_pps": int(received / seconds) if received > 0 else None,
+            f"udp64{prefix}_loss_pct": round(s.get("lost_percent", 0), 2) if s else None}
 
 
 def latency(client, server_ip: str) -> dict:
@@ -112,22 +84,27 @@ def run(net, gw: Gateway, report: Report, duration: int, requests: int, out_path
     client, server = net.get(c1.name), net.get(s2.name)
     pidfile = os.path.join(workdir, "iperf3_s2.pid")
     server.cmd(pinned(SERVER_CPU, f"iperf3 -s -D --pidfile {pidfile}"))
+    vip_pidfile = os.path.join(workdir, "iperf3_s2_vip.pid")
+    server.cmd(pinned(SERVER_CPU, f"iperf3 -s -p {BENCH_PORT} -D --pidfile {vip_pidfile}"))
     time.sleep(0.5)
 
     result = {"mode": gw.label, "duration_s": duration, "client_cpu": CLIENT_CPU,
-              "server_cpu": SERVER_CPU}
+              "server_cpu": SERVER_CPU, "user_rules": 0}  # empty rule tables, see paper
     try:
         result.update(tcp_throughput(client, s2.ip, duration))
         result.update(udp_small_packets(client, s2.ip, duration))
         result.update(latency(client, s2.ip))
-        if gw.has_load_balancer:  # the service is installed by Test 3 / topology.py
+        if gw.has_load_balancer:  # the services are installed by topology.py
+            # same measurements through the VIP: backend selection, NAT state, DNAT/SNAT
+            result.update(tcp_throughput(client, BENCH_VIP, duration, BENCH_PORT, "_vip"))
+            result.update(udp_small_packets(client, BENCH_VIP, duration, BENCH_PORT, "_vip"))
             result.update(lb_rate(client, requests))
         try:
             result.update(firewall_drop_rate(gw, client, c1.ip, s3.ip))
         except Unsupported:
             pass
     finally:
-        server.cmd(f"kill $(cat {pidfile}) 2>/dev/null")
+        server.cmd(f"kill $(cat {pidfile}) $(cat {vip_pidfile}) 2>/dev/null")
 
     print(json.dumps(result, indent=2))
     if out_path:

@@ -38,6 +38,22 @@ struct {
 	__type(value, struct backend);
 } lb_backends SEC(".maps");
 
+/* Active backends per service: lb_active[id * 16 + k] = backend index, k < n_act. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_SERVICES * MAX_BACKENDS_PER_SVC);
+	__type(key, __u32);
+	__type(value, __u32);
+} lb_active SEC(".maps");
+
+/* Backend endpoint (ip, port, proto) -> its service (endpoints are disjoint). */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_SERVICES * MAX_BACKENDS_PER_SVC);
+	__type(key, struct endpoint_key);
+	__type(value, struct endpoint_info);
+} lb_endpoints SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, MAX_CT_ENTRIES);

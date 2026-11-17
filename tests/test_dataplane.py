@@ -100,6 +100,20 @@ class FirewallTest(unittest.TestCase):
         self.assertEqual(len(dp.maps["fw_conntrack"].keys()), 1)
 
 
+class PatternMaskTest(unittest.TestCase):
+    def test_mask_tracks_populated_patterns(self):
+        dp = new_dp()
+        mask = lambda: dp.config.get().pattern_mask  # noqa: E731
+        self.assertEqual(mask(), 0)
+        dp.firewall.add(FirewallRule(src=C1, dst=S2, action="allow"))
+        dp.firewall.add(FirewallRule(dst=VIP, proto="tcp", dport=80, action="allow"))
+        self.assertEqual(mask(), (1 << FwMask.IP_PAIR) | (1 << FwMask.SVC_PORT))
+        dp.firewall.delete(FirewallRule(src=C1, dst=S2))
+        self.assertEqual(mask(), 1 << FwMask.SVC_PORT)
+        dp.firewall.flush()
+        self.assertEqual(mask(), 0)
+
+
 class ConfigTest(unittest.TestCase):
     def test_apply_only_changes_given_settings(self):
         dp = new_dp()
@@ -145,6 +159,33 @@ class LoadBalancerTest(unittest.TestCase):
             dp.lb.add_service("10.100.0.2", 80, ["10.0.2.2:80"])
         dp.lb.add_service("10.100.0.2", 80, ["10.0.2.2:8080"])   # other port: fine
         dp.lb.add_service(VIP, 80, ["10.0.2.1:80"])              # re-adding itself: fine
+
+    def test_active_list_excludes_drained_backends(self):
+        dp = new_dp()
+        sid = dp.lb.add_service(VIP, 80, ["10.0.2.1", "10.0.2.2", "10.0.2.3"])
+        dp.lb.set_backend_state(VIP, 80, "10.0.2.2", up=False)
+        (key,) = dp.maps["lb_services"].keys()
+        info = dp.maps["lb_services"].lookup(key)
+        active = [dp.maps["lb_active"].lookup(ct.c_uint32(sid * 16 + k)).value
+                  for k in range(info.active)]
+        self.assertEqual((info.count, active), (3, [0, 2]))
+
+    def test_endpoint_index_follows_the_pool(self):
+        dp = new_dp()
+        dp.lb.add_service(VIP, 80, ["10.0.2.1", "10.0.2.2"])
+        self.assertEqual(len(dp.maps["lb_endpoints"].keys()), 2)
+        dp.lb.add_service(VIP, 80, ["10.0.2.3"])          # replace the pool
+        (ek,) = dp.maps["lb_endpoints"].keys()
+        self.assertEqual(ek.ip, ip_to_wire("10.0.2.3"))
+        dp.lb.delete_service(VIP, 80)
+        self.assertEqual(dp.maps["lb_endpoints"].keys(), [])
+
+    def test_disjointness_is_per_protocol(self):
+        dp = new_dp()
+        dp.lb.add_service(VIP, 53, ["10.0.2.1:53"], proto="udp")
+        dp.lb.add_service("10.100.0.2", 53, ["10.0.2.1:53"], proto="tcp")  # other proto: ok
+        with self.assertRaises(ValueError):
+            dp.lb.add_service("10.100.0.3", 53, ["10.0.2.1:53"], proto="udp")
 
     def test_delete_service(self):
         dp = new_dp()

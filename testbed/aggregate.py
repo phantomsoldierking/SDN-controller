@@ -19,6 +19,8 @@ import sys
 METRICS = [
     ("tcp_gbps", "TCP Gbit/s"),
     ("udp64_rx_pps", "UDP64 rx pps"),
+    ("tcp_vip_gbps", "VIP TCP Gbit/s"),
+    ("udp64_vip_rx_pps", "VIP UDP64 pps"),
     ("rtt_avg_ms", "RTT avg ms"),
     ("rtt_max_ms", "RTT max ms"),
     ("lb_rps", "LB conn/s"),
@@ -118,8 +120,9 @@ def fmt(stat: dict | None) -> str:
     return f"{m:.3f} ±{h:.3f}"
 
 
-def compare(out: str, pairs: list[tuple[str, str]], metrics=("tcp_gbps", "udp64_rx_pps",
-                                                              "lb_rps", "fw_drop_pps")) -> None:
+def compare(out: str, pairs: list[tuple[str, str]],
+            metrics=("tcp_gbps", "udp64_rx_pps", "tcp_vip_gbps", "udp64_vip_rx_pps", "lb_rps",
+                     "fw_drop_pps")) -> None:
     """Print Welch tests of `a` vs `b` for each pair (difference relative to b)."""
     for a, b in pairs:
         ra, rb = load(out, a), load(out, b)

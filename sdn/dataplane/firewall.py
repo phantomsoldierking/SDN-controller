@@ -113,8 +113,16 @@ def describe_key(k: FwKey, rule: FwRule) -> dict:
 
 
 class Firewall:
-    def __init__(self, maps: dict[str, MapBackend], lock: threading.RLock, conntrack):
-        self._rules, self._lock, self._conntrack = maps["firewall_map"], lock, conntrack
+    def __init__(self, maps: dict[str, MapBackend], lock: threading.RLock, conntrack, config):
+        self._rules, self._lock = maps["firewall_map"], lock
+        self._conntrack, self._config = conntrack, config
+
+    def _sync_pattern_mask(self) -> None:
+        """Publish which patterns hold rules, so the data plane skips empty ones."""
+        mask = 0
+        for k in self._rules.keys():
+            mask |= 1 << k.mask
+        self._config.set_pattern_mask(mask)
 
     def add(self, rule: FirewallRule) -> int:
         keys = rule.keys()
@@ -122,6 +130,7 @@ class Firewall:
         with self._lock:
             for k in keys:
                 self._rules.update(k, FwRule(action=action))
+            self._sync_pattern_mask()
             if action == Action.DROP:
                 # A new DROP rule must not be bypassed by already-established state.
                 self._conntrack.flush_matching(
@@ -130,11 +139,15 @@ class Firewall:
 
     def delete(self, rule: FirewallRule) -> int:
         with self._lock:
-            return sum(self._rules.delete(k) for k in rule.keys())
+            n = sum(self._rules.delete(k) for k in rule.keys())
+            self._sync_pattern_mask()
+            return n
 
     def flush(self) -> int:
         with self._lock:
-            return sum(self._rules.delete(k) for k in self._rules.keys())
+            n = sum(self._rules.delete(k) for k in self._rules.keys())
+            self._sync_pattern_mask()
+            return n
 
     def list(self) -> list[dict]:
         return [describe_key(k, v) for k, v in self._rules.items()]

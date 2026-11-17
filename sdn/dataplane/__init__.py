@@ -31,7 +31,7 @@ class DataPlane:
         self.maps = maps
         self.config = ConfigStore(maps, lock)
         self.conntrack = ConnTrack(maps, lock)
-        self.firewall = Firewall(maps, lock, self.conntrack)
+        self.firewall = Firewall(maps, lock, self.conntrack, self.config)
         self.lb = LoadBalancer(maps, lock)
         self.telemetry = Telemetry(maps)
 

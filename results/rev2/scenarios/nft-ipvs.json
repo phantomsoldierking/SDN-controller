@@ -1,0 +1,73 @@
+{
+  "mode": "nft-ipvs",
+  "passed": true,
+  "checks": [
+    {
+      "name": "T1 pingall (8 hosts, 56 pairs)",
+      "ok": true,
+      "detail": "0.0% loss",
+      "result": "PASS"
+    },
+    {
+      "name": "T2a c1 -> s3 blocked",
+      "ok": true,
+      "detail": "",
+      "result": "PASS"
+    },
+    {
+      "name": "T2b c1 -> s2 still reachable",
+      "ok": true,
+      "detail": "",
+      "result": "PASS"
+    },
+    {
+      "name": "T2c drops counted in-kernel (drop_firewall)",
+      "ok": true,
+      "detail": "3 packets dropped by the data plane",
+      "result": "PASS"
+    },
+    {
+      "name": "T2d c1 -> s3 restored after rule removal",
+      "ok": true,
+      "detail": "",
+      "result": "PASS"
+    },
+    {
+      "name": "T3a all requests to VIP answered",
+      "ok": true,
+      "detail": "100 ok, 0 failed",
+      "result": "PASS"
+    },
+    {
+      "name": "T3b traffic spread over all backends",
+      "ok": true,
+      "detail": "s1=22, s2=27, s3=29, s4=22",
+      "result": "PASS"
+    },
+    {
+      "name": "T3c connection tracking populated",
+      "ok": true,
+      "detail": "100 tracked LB connections",
+      "result": "PASS"
+    },
+    {
+      "name": "T3d drained backend s1 receives no new connections",
+      "ok": true,
+      "detail": "{'s3': 6, 's2': 11, 's4': 8}",
+      "result": "PASS"
+    }
+  ],
+  "data": {
+    "t3_backend_counts": {
+      "s1": 22,
+      "s2": 27,
+      "s3": 29,
+      "s4": 22
+    },
+    "t3_after_drain": {
+      "s3": 6,
+      "s2": 11,
+      "s4": 8
+    }
+  }
+}

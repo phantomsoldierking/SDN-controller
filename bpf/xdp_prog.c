@@ -28,6 +28,7 @@
  */
 #include "xdp_nat.h"
 #include "tc_nat.h"
+#include "chain.h" /* tail-call ablation, microbenchmark only */
 
 SEC("xdp")
 int xdp_dataplane(struct xdp_md *ctx)

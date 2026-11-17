@@ -111,8 +111,24 @@ struct svc_key {
 };
 
 struct svc_info {
-	__u32 id;    /* slot in lb_backends: id * MAX_BACKENDS_PER_SVC + i */
-	__u32 count; /* number of configured backends */
+	__u32 id;     /* slot in lb_backends: id * MAX_BACKENDS_PER_SVC + i */
+	__u16 count;  /* n: configured backends */
+	__u16 active; /* n_act: entries of lb_active for this service */
+};
+
+/* lb_endpoints key/value: which service a backend endpoint belongs to. */
+struct endpoint_key {
+	__u32 ip;
+	__u16 port;
+	__u8 proto;
+	__u8 pad;
+};
+
+struct endpoint_info {
+	__u32 vip;
+	__u16 vport;
+	__u8 svc_id;
+	__u8 be_idx;
 };
 
 struct backend {
@@ -139,7 +155,8 @@ struct lb_ct {
 struct lb_rev {
 	__u32 vip;
 	__u16 vport;
-	__u16 pad;
+	__u8 svc_id; /* lets a reply re-create an evicted lb_conntrack entry */
+	__u8 be_idx;
 	__u64 last_seen_ns;
 	__u32 flags;
 	__u32 pad2;
@@ -158,6 +175,8 @@ struct flow_stat {
 struct dp_config {
 	__u32 default_action; /* ACT_ALLOW (or 0) / ACT_DROP for unmatched IPv4 */
 	__u32 flags;
+	__u32 pattern_mask;   /* bit i set: firewall_map holds rules of pattern i */
+	__u32 pad;
 };
 
 enum stat_idx {
@@ -174,6 +193,8 @@ enum stat_idx {
 	STAT_ARP,
 	STAT_NON_IP,
 	STAT_FIB_FORWARD,
+	STAT_DROP_ISOLATION, /* backend service endpoint reached without its VIP */
+	STAT_LB_RECOVERED,   /* lost LB state rebuilt from the surviving half */
 	STAT_MAX,
 };
 

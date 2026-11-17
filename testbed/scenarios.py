@@ -66,7 +66,7 @@ def test_load_balancer(net, gw: Gateway, report: Report, requests: int) -> None:
                ", ".join(f"{s.name}={totals.get(s.name, 0)}" for s in SERVERS))
 
     try:
-        n = gw.lb_connections()
+        n = gw.lb_connections(VIP, VPORT)
         report.add("T3c connection tracking populated", n > 0, f"{n} tracked LB connections")
     except Unsupported as e:
         report.skip("T3c conntrack", str(e))

@@ -12,7 +12,7 @@ import subprocess
 from dataclasses import dataclass
 
 from . import BPF_OBJ, BPF_SRC, BPF_SRC_DIR, PIN_DIR
-from .libbpf import (BPF_TC_EGRESS, BPF_TC_F_REPLACE, BPF_TC_INGRESS, XDP_FLAGS, BpfError,
+from .libbpf import (BPF_ANY, BPF_TC_EGRESS, BPF_TC_F_REPLACE, BPF_TC_INGRESS, XDP_FLAGS, BpfError,
                      TcHook, TcOpts, TestRunOpts, get_libbpf)
 
 log = logging.getLogger("sdn.loader")
@@ -86,10 +86,12 @@ class LoadedObject:
     so repeated loads (and every attached interface) share one set of maps.
     """
 
-    def __init__(self, hook: str, obj: str | None = None, pin_dir: str = PIN_DIR):
+    def __init__(self, hook: str, obj: str | None = None, pin_dir: str = PIN_DIR,
+                 programs: list[str] | None = None):
         self._lib = get_libbpf()
         self.hook, self.pin_dir = hook, pin_dir
-        self.program = PROGRAMS[hook]
+        self.programs = programs or [PROGRAMS[hook]]
+        self.program = self.programs[0]
         path = obj or build()
         ensure_bpffs()
         os.makedirs(pin_dir, exist_ok=True)
@@ -101,8 +103,12 @@ class LoadedObject:
             self._configure()
             self._lib.check(self._lib.bpf_object__load(self._obj),
                             "bpf_object__load (the verifier log is printed above)")
-            prog = self._lib.bpf_object__find_program_by_name(self._obj, self.program.encode())
-            self.prog_fd = self._lib.check(self._lib.bpf_program__fd(prog), "program fd")
+            self.prog_fds = {}
+            for name in self.programs:
+                prog = self._lib.bpf_object__find_program_by_name(self._obj, name.encode())
+                self.prog_fds[name] = self._lib.check(self._lib.bpf_program__fd(prog),
+                                                      f"program fd {name}")
+            self.prog_fd = self.prog_fds[self.program]
         except Exception:
             self.close()
             raise
@@ -114,11 +120,11 @@ class LoadedObject:
             self._lib.check(self._lib.bpf_map__set_pin_path(
                 m, os.path.join(self.pin_dir, name).encode()), f"pin {name}")
             m = self._lib.bpf_object__next_map(self._obj, m)
-        # Load only the requested program, so a problem in one hook can't block the other.
+        # Load only the requested programs, so a problem in one hook can't block another.
         p = self._lib.bpf_object__next_program(self._obj, None)
         while p:
             self._lib.bpf_program__set_autoload(p, self._lib.bpf_program__name(p).decode()
-                                                == self.program)
+                                                in self.programs)
             p = self._lib.bpf_object__next_program(self._obj, p)
 
     def attach(self, iface: str, xdp_mode: str = "auto") -> None:
@@ -138,7 +144,17 @@ class LoadedObject:
         log.info("%s attached to %s (ifindex %d, hook=%s%s)", self.program, iface, idx,
                  self.hook, f", mode={xdp_mode}" if self.hook == "xdp" else "")
 
-    def test_run(self, frame: bytes, repeat: int = 1) -> tuple[int, bytes, int]:
+    def fill_prog_array(self, map_name: str, programs: list[str], first_index: int = 0) -> None:
+        """Install loaded programs into a BPF_MAP_TYPE_PROG_ARRAY (tail-call targets)."""
+        fd = self._lib.check(self._lib.bpf_object__find_map_fd_by_name(
+            self._obj, map_name.encode()), f"map {map_name}")
+        for i, name in enumerate(programs, start=first_index):
+            key, value = ct.c_uint32(i), ct.c_uint32(self.prog_fds[name])
+            self._lib.check(self._lib.bpf_map_update_elem(fd, ct.byref(key), ct.byref(value),
+                                                          BPF_ANY), f"prog array {map_name}[{i}]")
+
+    def test_run(self, frame: bytes, repeat: int = 1,
+                 program: str | None = None) -> tuple[int, bytes, int]:
         """Run the program on `frame` with BPF_PROG_TEST_RUN (no interface needed).
 
         Returns (verdict, output frame, duration in ns). With repeat > 1 the
@@ -149,7 +165,8 @@ class LoadedObject:
         opts = TestRunOpts(sz=ct.sizeof(TestRunOpts), data_in=ct.cast(inp, ct.c_void_p),
                            data_out=ct.cast(out, ct.c_void_p), data_size_in=len(frame),
                            data_size_out=len(out), repeat=repeat)
-        rc = self._lib.bpf_prog_test_run_opts(self.prog_fd, ct.byref(opts))
+        fd = self.prog_fds[program] if program else self.prog_fd
+        rc = self._lib.bpf_prog_test_run_opts(fd, ct.byref(opts))
         if rc < 0:
             raise BpfError(f"BPF_PROG_TEST_RUN failed: {os.strerror(-rc)}")
         return opts.retval, out.raw[:opts.data_size_out], opts.duration
