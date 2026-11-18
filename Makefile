@@ -88,9 +88,9 @@ clean-net:
 
 deps-debian:
 	apt-get install -y clang llvm libbpf-dev libbpf1 linux-libc-dev \
-	    mininet openvswitch-switch iperf3 iproute2 ethtool curl python3 nftables ipvsadm
+	    mininet openvswitch-switch iperf3 iproute2 ethtool curl python3 nftables ipvsadm conntrack
 
 deps-arch:
 	pacman -S --needed clang llvm libbpf linux-api-headers iperf3 iproute2 \
-	    ethtool curl python openvswitch nftables ipvsadm
+	    ethtool curl python openvswitch nftables ipvsadm conntrack-tools
 	@echo "Mininet: install from the AUR (yay -S mininet)"

@@ -11,7 +11,8 @@ import os
 import shutil
 import unittest
 
-from sdn.codec import flow_key
+from sdn import abi
+from sdn.codec import flow_key, ip_to_wire, port_to_wire
 from sdn.dataplane import DataPlane, FirewallRule
 from sdn.loader import LoadedObject, build, unpin_maps
 from testbed import packets as P
@@ -356,6 +357,59 @@ class _DataPlaneCases:
         self.run_packet(frame)
         self.assertIsNone(self.dp.maps["lb_conntrack"].lookup(flow_key(C1, VIP, 43040, 80, 6)))
 
+    # ---- review round 3 ----
+    def test_dropped_reply_creates_no_lb_state(self):
+        """Reply classification is read-only: a reply whose reverse entry was lost
+        and that the firewall then drops must not re-create NAT state."""
+        self.add_service()
+        backend = self.backend_for(43100)
+        fwd, rk = flow_key(C1, VIP, 43100, 80, 6), flow_key(backend, C1, 80, 43100, 6)
+        saved = self.dp.maps["lb_conntrack"].lookup(fwd)
+        self.dp.firewall.add(FirewallRule(src=C1, dst=VIP, proto="tcp", dport=80))
+        self.dp.maps["lb_conntrack"].update(fwd, saved)       # keep L[f], lose T_rev
+        self.dp.maps["lb_reverse"].delete(rk)
+        verdict, _ = self.run_packet(P.build(backend, C1, 80, 43100, tcp_flags=0x10))
+        self.assertEqual(verdict, self.DROP)
+        self.assertIsNone(self.dp.maps["lb_reverse"].lookup(rk))
+
+    def test_reply_from_replaced_backend_slot_is_isolated(self):
+        """A reverse entry whose slot now holds another backend is stale."""
+        self.add_service(backends=[S1])
+        self.assertEqual(self.backend_for(43110), S1)
+        self.dp.lb.add_service(VIP, 80, [S2])                  # S1 replaced by S2 (slot 0)
+        rk = flow_key(S1, C1, 80, 43110, 6)
+        self.dp.maps["lb_reverse"].update(rk, abi.LbRev(       # stale entry survived
+            vip=ip_to_wire(VIP), vport=port_to_wire(80), svc_id=0, be_idx=0))
+        verdict, _ = self.run_packet(P.build(S1, C1, 80, 43110, tcp_flags=0x10))
+        self.assertEqual(verdict, self.DROP)
+
+    def test_syn_does_not_rejoin_a_stale_reverse_entry(self):
+        """A new TCP connection (SYN) reusing a client port is placed afresh and
+        cannot be captured by a leftover reverse entry of a draining backend."""
+        self.add_service()
+        old = self.backend_for(43120)
+        self.dp.lb.set_backend_state(VIP, 80, old, up=False)
+        self.dp.maps["lb_conntrack"].delete(flow_key(C1, VIP, 43120, 80, 6))
+        before = self.counter("lb_recovered")
+        self.assertNotEqual(self.backend_for(43120, flags=0x02), old)
+        self.assertEqual(self.counter("lb_recovered"), before)
+
+    def test_first_fragment_to_service_endpoint_is_dropped(self):
+        self.add_service()
+        self.assertEqual(self.run_packet(P.build(C1, S1, 43130, 80, frag_field=0x2000))[0],
+                         self.DROP)
+        self.assertEqual(self.run_packet(P.build(C1, S1, 43130, 22, frag_field=0x2000))[0],
+                         self.PASS)
+
+    def test_first_fragment_obeys_port_drop_rules(self):
+        self.dp.firewall.add(FirewallRule(src=C1, dst=S2, proto="tcp", dport=22))
+        self.assertEqual(self.run_packet(P.build(C1, S2, 43140, 22, frag_field=0x2000))[0],
+                         self.DROP)
+        self.assertEqual(self.run_packet(P.build(C1, S2, 43140, 23, frag_field=0x2000))[0],
+                         self.PASS)
+        # a non-first fragment carries no ports and is judged port-less
+        self.assertEqual(self.run_packet(P.build(C1, S2, 43140, 22, frag_field=0x0010))[0],
+                         self.PASS)
 
     def test_mac_rule_applies_to_non_ip_frames(self):
         self.dp.firewall.add(FirewallRule(src_mac="00:00:00:00:01:01"))
@@ -387,6 +441,7 @@ class _DataPlaneCases:
 
 
 CHAIN = ["xdp_chain_fw", "xdp_chain_lb", "xdp_chain_out"]
+CHAINM = ["xdp_chainm_fw", "xdp_chainm_lb", "xdp_chainm_out"]
 
 
 @unittest.skipIf(_skip_reason(), _skip_reason())
@@ -398,8 +453,10 @@ class ChainAblationTest(unittest.TestCase):
     def setUpClass(cls):
         cls.pin_dir = f"/sys/fs/bpf/sdn_test_chain_{os.getpid()}"
         build()
-        cls.obj = LoadedObject("xdp", pin_dir=cls.pin_dir, programs=["xdp_dataplane", *CHAIN])
+        cls.obj = LoadedObject("xdp", pin_dir=cls.pin_dir,
+                               programs=["xdp_dataplane", *CHAIN, *CHAINM])
         cls.obj.fill_prog_array("chain_progs", CHAIN)
+        cls.obj.fill_prog_array("chainm_progs", CHAINM)
         cls.dp = DataPlane.open(cls.pin_dir)
         cls.dp.config.apply(default_action="allow", stateful=True)
         cls.dp.lb.add_service(VIP, 80, BACKENDS)
@@ -424,8 +481,8 @@ class ChainAblationTest(unittest.TestCase):
         for name, frame in frames.items():
             with self.subTest(path=name):
                 mono = self.obj.test_run(frame)[:2]
-                chain = self.obj.test_run(frame, program="xdp_chain_fw")[:2]
-                self.assertEqual(chain, mono)
+                for entry in ("xdp_chain_fw", "xdp_chainm_fw"):
+                    self.assertEqual(self.obj.test_run(frame, program=entry)[:2], mono, entry)
 
 
 @unittest.skipIf(_skip_reason(), _skip_reason())

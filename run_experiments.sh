@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_experiments.sh - everything the paper reports, under one fixed CPU policy.
 #
-#   sudo ./run_experiments.sh             tests + scenarios + microbench + benchmark (~55 min)
+#   sudo ./run_experiments.sh             tests + scenarios + microbench + benchmark (~2.5 h)
 #   sudo ./run_experiments.sh --no-bench  tests + scenarios + microbench           (~7 min)
 #
 # The CPU frequency governor is set to `performance` for the whole run and
@@ -31,7 +31,15 @@ echo "*** unit + kernel tests"
 
 # ovs-vswitchd handles first-packet upcalls: run it on the performance-core
 # sibling threads (as the eBPF control-plane daemon) and restore it afterwards.
-OVS_PID=$(pidof ovs-vswitchd || true)
+# the host's daemon only (pidof also lists daemons inside containers)
+OVS_PID=$(cat /run/openvswitch/ovs-vswitchd.pid 2>/dev/null || true)
+if [[ -z $OVS_PID ]]; then
+  for pid in $(pidof ovs-vswitchd || true); do
+    if [[ $(readlink /proc/$pid/ns/pid) == $(readlink /proc/self/ns/pid) ]]; then
+      OVS_PID=$pid; break
+    fi
+  done
+fi
 AUX=$("$PY" -c 'from testbed.cpus import AUX_CPUS; print(AUX_CPUS)')
 if [[ -n $OVS_PID && -n $AUX ]]; then
   OVS_MASK=$(taskset -p "$OVS_PID" | awk '{print $NF}')
@@ -44,8 +52,8 @@ echo "*** functional scenarios (Tests 1-3)"
 mkdir -p "$OUT/scenarios"
 declare -A MODES=([ebpf-xdp]="ebpf --hook xdp" [ebpf-tc]="ebpf --hook tc"
                   [ebpf-tc-fib]="ebpf --hook tc --fib-forward" [kernel]="kernel"
-                  [nft-ipvs]="nft-ipvs" [ovs]="ovs" [ovs-ct]="ovs-ct")
-for label in ebpf-xdp ebpf-tc ebpf-tc-fib kernel nft-ipvs ovs ovs-ct; do
+                  [nft-ipvs]="nft-ipvs" [nft-ft]="nft-ft" [ovs]="ovs" [ovs-ct]="ovs-ct")
+for label in ebpf-xdp ebpf-tc ebpf-tc-fib kernel nft-ipvs nft-ft ovs ovs-ct; do
   mn -c >/dev/null 2>&1 || true
   # shellcheck disable=SC2086
   "$PY" topology.py --mode ${MODES[$label]} --test 1,2,3 \

@@ -77,19 +77,44 @@ static __always_inline int lb_select(struct svc_info *svc, __u32 hash, __u32 *ou
 	return -1;
 }
 
-/* Refresh (or, if the LRU evicted it, re-create) the reverse-NAT entry. */
-static __always_inline void rev_refresh(const struct flow_key *fwd, const struct lb_ct *ct,
-					__u64 now, __u32 flags)
+/* Does slot `idx` of service `svc_id` still hold backend (ip, port)? */
+static __always_inline int lb_slot_holds(__u32 svc_id, __u32 idx, __u32 ip, __u16 port,
+					 __u16 vport)
+{
+	struct backend *be;
+
+	if (svc_id >= MAX_SERVICES || idx >= MAX_BACKENDS_PER_SVC)
+		return 0;
+	be = backend_at(svc_id, idx);
+	return be && be->ip == ip && backend_port(be, vport) == port;
+}
+
+/* A TCP segment that opens a connection (SYN without ACK). */
+static __always_inline int tcp_opening(const struct pkt *p)
+{
+	return p->key.proto == IPPROTO_TCP_ && (p->tcp_flags & 0x12) == 0x02;
+}
+
+/*
+ * Write the reverse-NAT entry of a connection. `fresh` (new connection)
+ * overwrites any stale entry of an earlier connection with the same tuple;
+ * otherwise an existing entry is refreshed in place (keeping its flags) and
+ * a missing one - evicted by the LRU - is re-created.
+ */
+static __always_inline void rev_store(const struct flow_key *fwd, const struct lb_ct *ct,
+				      __u64 now, __u32 flags, int fresh)
 {
 	struct flow_key rk;
 	struct lb_rev *rev;
 
 	reply_key(fwd, ct->backend_ip, ct->backend_port, &rk);
-	rev = bpf_map_lookup_elem(&lb_reverse, &rk);
-	if (rev) {
-		rev->last_seen_ns = now;
-		rev->flags |= flags;
-		return;
+	if (!fresh) {
+		rev = bpf_map_lookup_elem(&lb_reverse, &rk);
+		if (rev) {
+			rev->last_seen_ns = now;
+			rev->flags |= flags;
+			return;
+		}
 	}
 	struct lb_rev nrev = {
 		.vip = fwd->daddr,
@@ -106,7 +131,8 @@ static __always_inline void rev_refresh(const struct flow_key *fwd, const struct
  * The forward entry of an established connection was lost (LRU eviction or a
  * reaper race) but its reverse entry survives: find the backend that holds it
  * and restore the binding, even if that backend is draining. Probes at most
- * n <= 16 reverse keys, only on a forward-entry miss.
+ * n <= 16 reverse keys; skipped for TCP SYNs, which always open a new
+ * connection (so a stale reverse entry cannot capture a reused port).
  */
 static __always_inline int lb_recover_forward(struct pkt *p, struct svc_info *svc,
 					      struct lb_ct *out)
@@ -124,7 +150,8 @@ static __always_inline int lb_recover_forward(struct pkt *p, struct svc_info *sv
 		reply_key(&p->key, be->ip, port, &rk);
 		struct lb_rev *rev = bpf_map_lookup_elem(&lb_reverse, &rk);
 
-		if (rev && rev->vip == p->key.daddr && rev->vport == p->key.dport) {
+		if (rev && rev->vip == p->key.daddr && rev->vport == p->key.dport &&
+		    rev->be_idx == i) {
 			out->backend_ip = be->ip;
 			out->backend_port = port;
 			out->svc_id = (__u8)svc->id;
@@ -139,7 +166,8 @@ static __always_inline int lb_recover_forward(struct pkt *p, struct svc_info *sv
  * Forward direction (client -> VIP). Established connections stay on their
  * backend even after it is drained; they are re-placed only if the backend
  * was removed or replaced, in which case its stale reverse entry is deleted.
- * Returns 1 if the packet must be dropped.
+ * Existing entries are updated in place (creation time and flags are kept);
+ * only new or recovered connections insert entries. Returns 1 to drop.
  */
 static __always_inline int lb_forward(struct pkt *p, struct svc_info *svc, struct verdict *v,
 				      __u64 now)
@@ -155,15 +183,13 @@ static __always_inline int lb_forward(struct pkt *p, struct svc_info *svc, struc
 	};
 
 	if (ct) {
-		struct backend *be = backend_at(ct->svc_id, ct->be_idx);
-
-		if (be && be->ip == ct->backend_ip &&
-		    backend_port(be, p->key.dport) == ct->backend_port) {
+		if (lb_slot_holds(ct->svc_id, ct->be_idx, ct->backend_ip, ct->backend_port,
+				  p->key.dport)) {
 			ct->last_seen_ns = now;
 			ct->packets += 1;
 			ct->bytes += p->len;
 			ct->flags |= flags;
-			rev_refresh(&p->key, ct, now, flags);
+			rev_store(&p->key, ct, now, flags, 0);
 			goto dnat;
 		}
 		/* backend removed or replaced: drop its reverse entry, re-place */
@@ -171,7 +197,7 @@ static __always_inline int lb_forward(struct pkt *p, struct svc_info *svc, struc
 
 		reply_key(&p->key, ct->backend_ip, ct->backend_port, &old);
 		bpf_map_delete_elem(&lb_reverse, &old);
-	} else if (lb_recover_forward(p, svc, &nct) == 0) {
+	} else if (!tcp_opening(p) && lb_recover_forward(p, svc, &nct) == 0) {
 		bpf_map_update_elem(&lb_conntrack, &p->key, &nct, BPF_ANY);
 		stat_add(STAT_LB_RECOVERED, 1);
 		ct = &nct;
@@ -190,7 +216,7 @@ static __always_inline int lb_forward(struct pkt *p, struct svc_info *svc, struc
 	nct.svc_id = (__u8)svc->id;
 	nct.be_idx = (__u8)idx;
 	bpf_map_update_elem(&lb_conntrack, &p->key, &nct, BPF_ANY);
-	rev_refresh(&p->key, &nct, now, flags);
+	rev_store(&p->key, &nct, now, flags, 1);
 	stat_add(STAT_LB_NEW_CONN, 1);
 	ct = &nct;
 
@@ -219,26 +245,39 @@ static __always_inline void client_flow(const struct pkt *p, __u32 vip, __u16 vp
 
 enum lb_reply_kind {
 	LB_NOT_REPLY = 0, /* not a load-balanced reply */
-	LB_REPLY = 1,     /* reply of a tracked connection; *rev is valid */
-	LB_ISOLATE = 2,   /* from a backend service endpoint without LB state: drop */
+	LB_REPLY = 1,     /* reply of a tracked connection; *info is valid */
+	LB_ISOLATE = 2,   /* from a backend service endpoint without valid LB state */
 };
 
 /*
- * Classify a packet that may be a backend's reply. A miss in lb_reverse is
- * resolved through lb_endpoints: if the source is a backend service endpoint
- * and the client's forward entry still names this backend, the reverse entry
- * is re-created; otherwise the packet carries a backend's real address
- * without LB state and is dropped, so it can never reach a client un-NATed.
+ * Classify a packet that may be a backend's reply (ClassifyReply in the
+ * paper). Read-only: it determines the rule key before the firewall runs;
+ * state is refreshed or re-created only after admission (lb_reverse_nat).
+ *
+ *  - T_rev hit whose service slot still holds this backend: REPLY.
+ *  - T_rev miss: if the source is a backend service endpoint (lb_endpoints)
+ *    and the client's forward entry names this backend in a slot that still
+ *    holds it, REPLY with the recovered (v, p_v, sigma, j).
+ *  - otherwise from a service endpoint: ISOLATE (the backend's real address
+ *    must never reach a client un-NATed).
+ * `*entry` points to the existing T_rev entry, or is NULL if it must be
+ * re-created.
  */
-static __always_inline int lb_reply_lookup(struct pkt *p, __u64 now, struct lb_rev **out)
+static __always_inline int lb_reply_lookup(struct pkt *p, struct lb_rev *info,
+					   struct lb_rev **entry)
 {
 	struct lb_rev *rev;
 
+	*entry = 0;
 	if (p->key.l3 != L3_IPV4 || !p->has_ports)
 		return LB_NOT_REPLY;
 	rev = bpf_map_lookup_elem(&lb_reverse, &p->key);
 	if (rev) {
-		*out = rev;
+		if (!lb_slot_holds(rev->svc_id, rev->be_idx, p->key.saddr, p->key.sport,
+				   rev->vport))
+			return LB_ISOLATE; /* backend removed or replaced: stale state */
+		*info = *rev;
+		*entry = rev;
 		return LB_REPLY;
 	}
 
@@ -252,51 +291,56 @@ static __always_inline int lb_reply_lookup(struct pkt *p, __u64 now, struct lb_r
 	client_flow(p, ep->vip, ep->vport, &fwd);
 	struct lb_ct *ct = bpf_map_lookup_elem(&lb_conntrack, &fwd);
 
-	if (!ct || ct->backend_ip != p->key.saddr || ct->backend_port != p->key.sport)
+	if (!ct || ct->backend_ip != p->key.saddr || ct->backend_port != p->key.sport ||
+	    !lb_slot_holds(ct->svc_id, ct->be_idx, p->key.saddr, p->key.sport, ep->vport))
 		return LB_ISOLATE;
-	struct lb_rev nrev = {
-		.vip = ep->vip,
-		.vport = ep->vport,
-		.svc_id = ct->svc_id,
-		.be_idx = ct->be_idx,
-		.last_seen_ns = now,
-	};
-	bpf_map_update_elem(&lb_reverse, &p->key, &nrev, BPF_ANY);
-	rev = bpf_map_lookup_elem(&lb_reverse, &p->key);
-	if (!rev)
-		return LB_ISOLATE;
-	stat_add(STAT_LB_RECOVERED, 1);
-	*out = rev;
+	__builtin_memset(info, 0, sizeof(*info));
+	info->vip = ep->vip;
+	info->vport = ep->vport;
+	info->svc_id = ct->svc_id;
+	info->be_idx = ct->be_idx;
 	return LB_REPLY;
 }
 
 /*
- * Reverse direction (backend -> client). The reply refreshes the forward
- * entry too - or re-creates it from the reverse entry if it was lost - so a
- * server-to-client stream keeps the connection alive and a server FIN/RST
- * shortens its timeout.
+ * Reverse direction (backend -> client), after admission. Refreshes T_rev or
+ * re-creates it from the classification; refreshes the forward entry too - or
+ * re-creates it if it was lost - so a server-to-client stream keeps the
+ * connection alive and a server FIN/RST shortens its timeout.
  */
-static __always_inline void lb_reverse_nat(struct pkt *p, struct lb_rev *rev, struct verdict *v,
-					   __u64 now)
+static __always_inline void lb_reverse_nat(struct pkt *p, const struct lb_rev *info,
+					   struct lb_rev *entry, struct verdict *v, __u64 now)
 {
 	__u32 flags = tcp_ct_flags(p);
 	struct flow_key fwd;
 	struct lb_ct *ct;
 
-	rev->last_seen_ns = now;
-	rev->flags |= flags;
+	if (!entry)
+		entry = bpf_map_lookup_elem(&lb_reverse, &p->key);
+	if (entry) {
+		entry->last_seen_ns = now;
+		entry->flags |= flags;
+	} else {
+		struct lb_rev nrev = *info;
 
-	client_flow(p, rev->vip, rev->vport, &fwd);
+		nrev.last_seen_ns = now;
+		nrev.flags = flags;
+		bpf_map_update_elem(&lb_reverse, &p->key, &nrev, BPF_ANY);
+		stat_add(STAT_LB_RECOVERED, 1);
+	}
+
+	client_flow(p, info->vip, info->vport, &fwd);
 	ct = bpf_map_lookup_elem(&lb_conntrack, &fwd);
 	if (ct) {
 		ct->last_seen_ns = now;
 		ct->flags |= flags;
 	} else {
+		/* classification checked that slot be_idx still holds this backend */
 		struct lb_ct nct = {
 			.backend_ip = p->key.saddr,
 			.backend_port = p->key.sport,
-			.svc_id = rev->svc_id,
-			.be_idx = rev->be_idx,
+			.svc_id = info->svc_id,
+			.be_idx = info->be_idx,
 			.created_ns = now,
 			.last_seen_ns = now,
 			.flags = flags,
@@ -307,20 +351,20 @@ static __always_inline void lb_reverse_nat(struct pkt *p, struct lb_rev *rev, st
 
 	v->nat = NAT_SNAT;
 	v->old_addr = p->key.saddr;
-	v->new_addr = rev->vip;
+	v->new_addr = info->vip;
 	v->old_port = p->key.sport;
-	v->new_port = rev->vport;
+	v->new_port = info->vport;
 	stat_add(STAT_LB_SNAT, 1);
 }
 
 /* Returns 1 if the packet must be dropped. */
-static __always_inline int load_balance(struct pkt *p, struct lb_rev *rev, struct verdict *v,
-					__u64 now)
+static __always_inline int load_balance(struct pkt *p, int kind, const struct lb_rev *info,
+					struct lb_rev *entry, struct verdict *v, __u64 now)
 {
 	if (p->key.l3 != L3_IPV4 || !p->has_ports)
 		return 0;
-	if (rev) {
-		lb_reverse_nat(p, rev, v, now);
+	if (kind == LB_REPLY) {
+		lb_reverse_nat(p, info, entry, v, now);
 		return 0;
 	}
 
@@ -342,6 +386,22 @@ static __always_inline int load_balance(struct pkt *p, struct lb_rev *rev, struc
 		return 1;
 	}
 	return 0;
+}
+
+/*
+ * First fragment of a TCP/UDP datagram to or from a backend service
+ * endpoint: dropped (endpoint isolation), since fragments are never NAT-ed.
+ * Without its first fragment the receiver cannot reassemble the datagram.
+ */
+static __always_inline int first_fragment_blocked(const struct pkt *p)
+{
+	struct endpoint_key ek = {.ip = p->key.daddr, .port = p->ff_dport, .proto = p->key.proto};
+
+	if (bpf_map_lookup_elem(&lb_endpoints, &ek))
+		return 1;
+	ek.ip = p->key.saddr;
+	ek.port = p->ff_sport;
+	return bpf_map_lookup_elem(&lb_endpoints, &ek) != 0;
 }
 
 #endif /* SDN_LB_H */

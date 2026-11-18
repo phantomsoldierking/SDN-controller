@@ -16,7 +16,8 @@ import socket
 import struct
 import sys
 import time
-import urllib.request
+import http.client
+import urllib.parse
 
 SIOCETHTOOL, ETHTOOL_STXCSUM = 0x8946, 0x00000017
 
@@ -31,23 +32,31 @@ def txoff(iface: str) -> None:
 
 
 def probe(url: str, n: int, timeout: float = 2.0) -> dict:
+    """n HTTP requests, one TCP connection each; records which backend answered
+    and the client's ephemeral port of every connection."""
+    parts = urllib.parse.urlsplit(url)
     backends: dict[str, int] = {}
     ok = fail = 0
-    latencies = []
+    latencies, conns = [], []
     start = time.perf_counter()
     for _ in range(n):
         t = time.perf_counter()
+        conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
         try:
-            req = urllib.request.Request(url, headers={"Connection": "close"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                body = r.read().decode().strip()
+            conn.connect()
+            sport = conn.sock.getsockname()[1]
+            conn.request("GET", parts.path or "/", headers={"Connection": "close"})
+            body = conn.getresponse().read().decode().strip()
             backends[body] = backends.get(body, 0) + 1
+            conns.append([sport, body])
             ok += 1
             latencies.append((time.perf_counter() - t) * 1000)
         except OSError:
             fail += 1
+        finally:
+            conn.close()
     elapsed = time.perf_counter() - start
-    return {"ok": ok, "fail": fail, "backends": backends,
+    return {"ok": ok, "fail": fail, "backends": backends, "connections": conns,
             "rps": round(ok / elapsed, 1) if elapsed else 0,
             "avg_ms": round(sum(latencies) / len(latencies), 3) if latencies else None}
 

@@ -75,14 +75,27 @@ static __always_inline int parse_packet(void *data, void *data_end, struct pkt *
 	p->key.daddr = iph->daddr;
 	p->key.proto = iph->protocol;
 
-	/* Non-first fragments carry no L4 header. */
+	void *l4 = (void *)iph + ihl_len;
+
 	/* No reassembly: every fragment, including the first one (MF set,
 	 * offset 0), is treated as port-less, so all fragments of a datagram
-	 * share one key and none of them is load-balanced or NAT-rewritten. */
-	if (iph->frag_off & bpf_htons(IP_OFFSET | IP_MF))
-		return PARSE_OK;
+	 * share one key and none of them is load-balanced or NAT-rewritten.
+	 * The first fragment's ports are recorded separately: they are used only
+	 * to drop it (port DROP rules, endpoint isolation), which makes the whole
+	 * datagram unreassemblable, never to admit it. */
+	if (iph->frag_off & bpf_htons(IP_OFFSET | IP_MF)) {
+		if (!(iph->frag_off & bpf_htons(IP_OFFSET)) &&
+		    (iph->protocol == IPPROTO_TCP_ || iph->protocol == IPPROTO_UDP_)) {
+			__u16 *ports = l4;
 
-	void *l4 = (void *)iph + ihl_len;
+			if ((void *)(ports + 2) <= data_end) {
+				p->first_frag = 1;
+				p->ff_sport = ports[0];
+				p->ff_dport = ports[1];
+			}
+		}
+		return PARSE_OK;
+	}
 
 	if (iph->protocol == IPPROTO_TCP_) {
 		struct tcphdr *th = l4;

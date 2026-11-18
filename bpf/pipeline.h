@@ -58,12 +58,33 @@ static __always_inline int pipeline(void *data, void *data_end, struct pkt *p,
 		return 0;
 	}
 
+	/* First fragment: may be dropped by its ports, never admitted by them. */
+	if (p->first_frag) {
+		struct flow_key fk = p->key;
+		__u32 stat = STAT_DROP_ISOLATION;
+		int blocked = first_fragment_blocked(p);
+
+		fk.sport = p->ff_sport;
+		fk.dport = p->ff_dport;
+		if (!blocked && fw_ip_lookup(&fk, 1, fw_pattern_mask(cfg)) == ACT_DROP) {
+			blocked = 1;
+			stat = STAT_DROP_FW;
+		}
+		if (blocked) {
+			stat_add(stat, 1);
+			v->drop = 1;
+			return 0;
+		}
+	}
+
 	/*
 	 * Rule key: a load-balanced connection is judged in its client->VIP
 	 * orientation in both directions, so one VIP rule covers the connection.
+	 * Classification is read-only; LB state changes only after admission.
 	 */
-	struct lb_rev *rev = 0;
-	int kind = lb_reply_lookup(p, now, &rev);
+	struct lb_rev info;
+	struct lb_rev *entry = 0;
+	int kind = lb_reply_lookup(p, &info, &entry);
 	struct flow_key ck = p->key;
 
 	if (kind == LB_ISOLATE) {
@@ -71,15 +92,15 @@ static __always_inline int pipeline(void *data, void *data_end, struct pkt *p,
 		v->drop = 1;
 		return 0;
 	}
-	if (kind == LB_REPLY && rev)
-		client_flow(p, rev->vip, rev->vport, &ck);
+	if (kind == LB_REPLY)
+		client_flow(p, info.vip, info.vport, &ck);
 
 	if (firewall_ip(&ck, p->has_ports, cfg)) {
 		stat_add(STAT_DROP_FW, 1);
 		v->drop = 1;
 		return 0;
 	}
-	if (load_balance(p, rev, v, now)) {
+	if (load_balance(p, kind, &info, entry, v, now)) {
 		v->drop = 1;
 		return 0;
 	}

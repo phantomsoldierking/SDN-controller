@@ -9,8 +9,11 @@
 #   sudo ./benchmark.sh                          # all configurations, 10 rounds
 #   sudo REPEATS=3 DURATION=5 ./benchmark.sh ebpf-xdp kernel
 #
-# Configurations: ebpf-xdp ebpf-tc ebpf-tc-fib kernel nft-ipvs ovs ovs-ct
+# Configurations: ebpf-xdp ebpf-tc ebpf-tc-fib kernel nft-ipvs nft-ft ovs ovs-ct, and
+#                 <config>+rules: the same with BG_RULES non-matching rules that
+#                 populate all ten rule patterns (gateways with a firewall only)
 # Environment:    REPEATS (10)  DURATION s (10)  REQUESTS (50)  OUT (results/repeated)
+#                 BG_RULES (1000)
 #                 SDN_CLIENT_CPU / SDN_SERVER_CPU (default: two fastest cores)
 #                 KEEP_GOVERNOR=1 to leave the CPU frequency governor alone
 set -euo pipefail
@@ -22,7 +25,10 @@ REQUESTS=${REQUESTS:-50}
 OUT=${OUT:-results/repeated}
 PY=${PYTHON:-python3}
 CONFIGS=("$@")
-[[ ${#CONFIGS[@]} -eq 0 ]] && CONFIGS=(ebpf-xdp ebpf-tc ebpf-tc-fib kernel nft-ipvs ovs ovs-ct)
+BG_RULES=${BG_RULES:-1000}
+[[ ${#CONFIGS[@]} -eq 0 ]] && CONFIGS=(ebpf-xdp ebpf-tc ebpf-tc-fib kernel nft-ipvs nft-ft ovs ovs-ct
+                                       ebpf-tc+rules ebpf-tc-fib+rules nft-ipvs+rules
+                                       nft-ft+rules ovs-ct+rules)
 
 [[ $EUID -eq 0 ]] || { echo "run as root (sudo $0)"; exit 1; }
 for bin in iperf3 ping taskset; do
@@ -42,19 +48,23 @@ if [[ -z ${KEEP_GOVERNOR:-} && -e ${GOV_FILES[0]} ]]; then
 fi
 
 available() {
-  case $1 in
+  case ${1%+rules} in
     ovs|ovs-ct) ovs-vsctl show >/dev/null 2>&1 || { echo "skip $1: Open vSwitch not running"; return 1; } ;;
     nft-ipvs)   command -v ipvsadm >/dev/null && command -v nft >/dev/null \
                   || { echo "skip $1: needs nft and ipvsadm"; return 1; } ;;
+    nft-ft)     command -v nft >/dev/null || { echo "skip $1: needs nft"; return 1; } ;;
   esac
 }
 
 args_for() {
-  case $1 in
-    ebpf-xdp)    echo "--mode ebpf --hook xdp" ;;
-    ebpf-tc)     echo "--mode ebpf --hook tc" ;;
-    ebpf-tc-fib) echo "--mode ebpf --hook tc --fib-forward" ;;
-    kernel|nft-ipvs|ovs|ovs-ct) echo "--mode $1" ;;
+  local extra=""
+  [[ $1 == *+rules ]] && extra=" --bg-rules $BG_RULES"
+  case ${1%+rules} in
+    ebpf-xdp)    echo "--mode ebpf --hook xdp$extra" ;;
+    ebpf-tc)     echo "--mode ebpf --hook tc$extra" ;;
+    ebpf-tc-fib) echo "--mode ebpf --hook tc --fib-forward$extra" ;;
+    kernel|ovs)  [[ -z $extra ]] || { echo "$1: no firewall" >&2; exit 1; }; echo "--mode $1" ;;
+    nft-ipvs|nft-ft|ovs-ct) echo "--mode ${1%+rules}$extra" ;;
     *) echo "unknown configuration: $1" >&2; exit 1 ;;
   esac
 }
@@ -79,6 +89,7 @@ mkdir -p "$OUT"
   echo "nft:        $(nft --version 2>/dev/null || echo n/a)"
   echo "ipvsadm:    $(ipvsadm --version 2>/dev/null || echo n/a)"
   echo "repeats:    $REPEATS x ${DURATION}s, configs: ${RUN_CONFIGS[*]}"
+  echo "bg rules:   $BG_RULES (in +rules configurations)"
 } > "$OUT/environment.txt"
 cat "$OUT/environment.txt"
 

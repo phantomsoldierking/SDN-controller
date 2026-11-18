@@ -20,6 +20,10 @@ struct pkt {
 	__u16 l3_proto; /* host order ETH_P_* */
 	__u8 tcp_flags;
 	__u8 has_ports;
+	__u8 first_frag;  /* first fragment of a TCP/UDP datagram with readable ports */
+	__u8 pad;
+	__u16 ff_sport;   /* its ports (network order); used only to block, never to admit */
+	__u16 ff_dport;
 	struct flow_key key;
 };
 

@@ -6,6 +6,11 @@
 Reads OUT/raw/<config>/run*.json and writes OUT/summary.json; prints a table.
 The confidence interval uses Student's t distribution with n-1 degrees of
 freedom, so it is valid for the small number of runs used here.
+
+Comparisons: rounds are interleaved (round r runs every configuration once),
+so run r of two configurations forms a pair. `paired()` tests the per-round
+relative difference 100*(a_r/b_r - 1) against 0 (paired t-test) and gives its
+95% CI; `welch()` is the unpaired test, kept for reference.
 """
 from __future__ import annotations
 
@@ -87,6 +92,34 @@ def welch(a: list[float], b: list[float]) -> dict:
     return {"diff_pct": 100 * (ma / mb - 1), "t": t, "dof": dof, "p": p}
 
 
+def t_cdf_two_sided(t: float, dof: float) -> float:
+    """Two-sided p-value of Student's t."""
+    return _betai(dof / 2, 0.5, dof / (dof + t * t))
+
+
+def paired(a: dict[str, float], b: dict[str, float]) -> dict:
+    """Paired t-test on per-round relative differences (rounds present in both)."""
+    rounds = sorted(set(a) & set(b))
+    d = [100 * (a[r] / b[r] - 1) for r in rounds]
+    n = len(d)
+    mean = statistics.fmean(d)
+    sd = statistics.stdev(d) if n > 1 else 0.0
+    half = t975(n - 1) * sd / math.sqrt(n) if n > 1 else 0.0
+    t = mean / (sd / math.sqrt(n)) if sd > 0 else math.inf
+    p = t_cdf_two_sided(t, n - 1) if math.isfinite(t) else 0.0
+    return {"n": n, "diff_pct": mean, "ci95": half, "t": t, "dof": n - 1, "p": p}
+
+
+def by_round(out: str, config: str, key: str) -> dict[str, float]:
+    vals = {}
+    for path in sorted(glob.glob(os.path.join(out, "raw", config, "run*.json"))):
+        with open(path) as f:
+            v = json.load(f).get(key)
+        if v is not None:
+            vals[os.path.basename(path)] = v
+    return vals
+
+
 def load(out: str, config: str) -> list[dict]:
     runs = []
     for path in sorted(glob.glob(os.path.join(out, "raw", config, "run*.json"))):
@@ -123,16 +156,15 @@ def fmt(stat: dict | None) -> str:
 def compare(out: str, pairs: list[tuple[str, str]],
             metrics=("tcp_gbps", "udp64_rx_pps", "tcp_vip_gbps", "udp64_vip_rx_pps", "lb_rps",
                      "fw_drop_pps")) -> None:
-    """Print Welch tests of `a` vs `b` for each pair (difference relative to b)."""
+    """Paired and Welch tests of `a` vs `b` for each pair (difference relative to b)."""
     for a, b in pairs:
-        ra, rb = load(out, a), load(out, b)
         for key in metrics:
-            va = [r[key] for r in ra if r.get(key) is not None]
-            vb = [r[key] for r in rb if r.get(key) is not None]
+            va, vb = by_round(out, a, key), by_round(out, b, key)
             if len(va) > 1 and len(vb) > 1:
-                w = welch(va, vb)
-                print(f"{a:>12} vs {b:<12} {key:14} {w['diff_pct']:+7.1f}%  "
-                      f"t={w['t']:+6.2f}  dof={w['dof']:5.1f}  p={w['p']:.4f}")
+                pr = paired(va, vb)
+                w = welch(list(va.values()), list(vb.values()))
+                print(f"{a:>14} vs {b:<14} {key:16} paired {pr['diff_pct']:+6.1f}% "
+                      f"±{pr['ci95']:4.1f}  p={pr['p']:.4f}   welch p={w['p']:.4f}")
 
 
 def main(argv: list[str]) -> int:
@@ -147,8 +179,11 @@ def main(argv: list[str]) -> int:
     if not summary:
         print("no results found")
         return 1
-    with open(os.path.join(out, "summary.json"), "w") as f:
-        json.dump(summary, f, indent=2)
+    try:
+        with open(os.path.join(out, "summary.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+    except PermissionError:
+        print(f"note: {out}/summary.json not writable; table printed only")
     width = [12] + [16] * len(METRICS) + [4]
     row = lambda cells: "  ".join(str(c).ljust(w) for c, w in zip(cells, width))  # noqa: E731
     print("\n" + row(["config"] + [h for _, h in METRICS] + ["n"]))

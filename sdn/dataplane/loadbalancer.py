@@ -1,8 +1,10 @@
 """L4 load-balancer services and backend pools (lb_services + lb_backends).
 
-Service `id` owns the backend array slots id*16 .. id*16+15. Backends are
-written before the service entry is published, so the data plane never sees
-a service whose pool is not populated yet.
+Service `id` owns the backend array slots id*16 .. id*16+15. A backend keeps
+its slot for as long as it stays in the pool (replacing a service never
+shifts the others), because established connections refer to their backend
+by slot. Backends are written before the service entry is published, so the
+data plane never sees a service whose pool is not populated yet.
 """
 from __future__ import annotations
 
@@ -35,42 +37,75 @@ class LoadBalancer:
                   state, and isolates backend endpoints from direct access
     """
 
-    def __init__(self, maps: dict[str, MapBackend], lock: threading.RLock):
+    def __init__(self, maps: dict[str, MapBackend], lock: threading.RLock, conntrack=None):
         self._services, self._backends = maps["lb_services"], maps["lb_backends"]
         self._active, self._endpoints = maps["lb_active"], maps["lb_endpoints"]
-        self._lock = lock
+        self._lock, self._conntrack = lock, conntrack
 
     def add_service(self, vip: str, port: int, backends: list[str], proto: str = "tcp") -> int:
-        """Create or replace a service. Backends are 'ip' or 'ip:port'."""
+        """Create or replace a service. Backends are 'ip' or 'ip:port'.
+
+        On replacement, backends that remain keep their slot; removed backends
+        leave an empty slot and their connection state is flushed; new
+        backends take the lowest free slots."""
         if not 0 < len(backends) <= MAX_BACKENDS_PER_SVC:
             raise ValueError(f"1..{MAX_BACKENDS_PER_SVC} backends required")
         endpoints = [parse_endpoint(b, port) for b in backends]
+        wanted = [(ip_to_wire(ip), port_to_wire(bport)) for ip, bport in endpoints]
+        if len(set(wanted)) != len(wanted):
+            raise ValueError("duplicate backend")
         key = _service_key(vip, port, proto)
         with self._lock:
             self._check_disjoint(key, endpoints)
             existing = self._services.lookup(key)
             svc_id = existing.id if existing is not None else self._free_id()
+            slots: list[tuple[int, int] | None] = [None] * MAX_BACKENDS_PER_SVC
+            removed = []
             if existing is not None:
+                for i in range(existing.count):
+                    be = self._backends.lookup(_slot(svc_id, i))
+                    if be is None or not be.ip:
+                        continue
+                    if (be.ip, be.port) in wanted:
+                        slots[i] = (be.ip, be.port)
+                    else:
+                        removed.append((be.ip, be.port))
                 self._remove_endpoints(svc_id, existing.count, key.proto)
+            for ep in wanted:
+                if ep not in slots:
+                    slots[slots.index(None)] = ep
+            count = max(i for i, ep in enumerate(slots) if ep is not None) + 1
             pool = []
             for i in range(MAX_BACKENDS_PER_SVC):
-                if i < len(endpoints):
-                    ip, bport = endpoints[i]
-                    be = Backend(ip=ip_to_wire(ip), port=port_to_wire(bport), active=1)
-                    pool.append(be)
+                if slots[i] is not None:
+                    be = Backend(ip=slots[i][0], port=slots[i][1], active=1)
                     self._endpoints.update(
                         EndpointKey(ip=be.ip, port=be.port, proto=key.proto),
                         EndpointInfo(vip=key.vip, vport=key.port, svc_id=svc_id, be_idx=i))
                 else:
                     be = Backend()
+                pool.append(be)
                 self._backends.update(_slot(svc_id, i), be)
             # Publish the active list before the service entry, so the data plane
             # never sees a service whose pool is not populated yet.
-            n_act = self._write_active(svc_id, pool)
-            self._services.update(key, SvcInfo(id=svc_id, count=len(pool), active=n_act))
+            n_act = self._write_active(svc_id, pool[:count])
+            self._services.update(key, SvcInfo(id=svc_id, count=count, active=n_act))
+            self._flush_backends(removed, key.proto)
         return svc_id
 
+    def _flush_backends(self, backends: list[tuple[int, int]], proto: int) -> None:
+        if self._conntrack is not None:
+            for ip, bport in backends:
+                self._conntrack.flush_backend(ip, bport, proto)
+
     def _write_active(self, svc_id: int, pool: list[Backend]) -> int:
+        """Write the active-backend list; the caller publishes the new count after.
+
+        Order matters because the data plane reads lb_active[h mod n_act]
+        concurrently: entries are written before the count changes, so a
+        restore never exposes an unwritten slot. During a drain the old count
+        may briefly cover a stale entry naming the drained backend, which the
+        data plane skips because that backend's active flag is cleared first."""
         active = [i for i, be in enumerate(pool) if be.active and be.ip]
         for k, idx in enumerate(active):
             self._active.update(_slot(svc_id, k), ct.c_uint32(idx))
@@ -108,9 +143,12 @@ class LoadBalancer:
             if info is None:
                 return False
             self._services.delete(key)
+            pool = [self._backends.lookup(_slot(info.id, i)) for i in range(info.count)]
             self._remove_endpoints(info.id, info.count, key.proto)
             for i in range(MAX_BACKENDS_PER_SVC):
                 self._backends.update(_slot(info.id, i), Backend())
+            self._flush_backends([(be.ip, be.port) for be in pool if be is not None and be.ip],
+                                 key.proto)
         return True
 
     def set_backend_state(self, vip: str, port: int, backend: str, up: bool,
@@ -141,7 +179,7 @@ class LoadBalancer:
             pool = []
             for i in range(info.count):
                 be = self._backends.lookup(_slot(info.id, i))
-                if be is not None:
+                if be is not None and be.ip:
                     pool.append({"ip": wire_to_ip(be.ip), "port": wire_to_port(be.port),
                                  "active": bool(be.active)})
             out.append({"vip": wire_to_ip(key.vip), "port": wire_to_port(key.port),

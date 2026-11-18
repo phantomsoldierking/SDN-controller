@@ -1,0 +1,29 @@
+{
+  "mode": "ebpf-xdp",
+  "duration_s": 10,
+  "client_cpu": "0",
+  "server_cpu": "2",
+  "background_rules": 0,
+  "tcp_gbps": 10.052,
+  "udp64_rx_pps": 532993,
+  "udp64_loss_pct": 0.79,
+  "rtt_min_ms": 0.002,
+  "rtt_avg_ms": 0.007,
+  "rtt_max_ms": 0.039,
+  "rtt_mdev_ms": 0.007,
+  "tcp_vip_gbps": 8.873,
+  "udp64_vip_rx_pps": 460496,
+  "udp64_vip_loss_pct": 0.21,
+  "lb_rps": 912.7,
+  "lb_avg_ms": 1.093,
+  "lb_fail": 0,
+  "conntrack_entries": {
+    "firewall": 204,
+    "lb": 202,
+    "lb_reverse": 202
+  },
+  "fw_drop_pps": 890277,
+  "fw_drop_sent": 2671104,
+  "fw_dropped": 2671104,
+  "fw_drop_seconds": 3.000304
+}

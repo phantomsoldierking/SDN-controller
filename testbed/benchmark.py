@@ -75,7 +75,7 @@ def firewall_drop_rate(gw: Gateway, client, src_ip: str, dst_ip: str) -> dict:
 
 
 def run(net, gw: Gateway, report: Report, duration: int, requests: int, out_path: str | None,
-        workdir: str) -> dict:
+        workdir: str, bg_rules: int = 0) -> dict:
     print(f"\n*** Test 4: performance benchmark [{gw.label}]")
     if not shutil.which("iperf3"):
         report.skip("T4 benchmark", "iperf3 not installed")
@@ -89,7 +89,7 @@ def run(net, gw: Gateway, report: Report, duration: int, requests: int, out_path
     time.sleep(0.5)
 
     result = {"mode": gw.label, "duration_s": duration, "client_cpu": CLIENT_CPU,
-              "server_cpu": SERVER_CPU, "user_rules": 0}  # empty rule tables, see paper
+              "server_cpu": SERVER_CPU, "background_rules": bg_rules}
     try:
         result.update(tcp_throughput(client, s2.ip, duration))
         result.update(udp_small_packets(client, s2.ip, duration))
@@ -99,6 +99,8 @@ def run(net, gw: Gateway, report: Report, duration: int, requests: int, out_path
             result.update(tcp_throughput(client, BENCH_VIP, duration, BENCH_PORT, "_vip"))
             result.update(udp_small_packets(client, BENCH_VIP, duration, BENCH_PORT, "_vip"))
             result.update(lb_rate(client, requests))
+        if hasattr(gw, "table_sizes"):
+            result["conntrack_entries"] = gw.table_sizes()
         try:
             result.update(firewall_drop_rate(gw, client, c1.ip, s3.ip))
         except Unsupported:

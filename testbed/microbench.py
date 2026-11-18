@@ -8,9 +8,11 @@ the kernel's own measurement of the program's run time.
   rules       cost vs number of installed rules (0..10,000 over all ten
               patterns, none matching: every populated pattern is probed)
   conntrack   cost vs connection-table occupancy (0..60,000 entries per table)
-  cold        one flow vs cycling through 60,000 distinct tracked flows
-  paths       pass, firewall drop, DNAT (new and established), SNAT
-  chain       single program vs the same pipeline as a 3-stage tail-call chain
+  cold        one flow vs cycling through 1,000 / 15,000 / 60,000 tracked flows
+              (15,000 fits the 16,384-entry telemetry table; 60,000 does not)
+  paths       pass, firewall drop, DNAT (new TCP, new UDP, established), SNAT
+  chain       single program vs the same pipeline as a 3-stage tail-call chain,
+              with re-parsing (chain) and with shared parse metadata (chainm)
   uniformity  backend choice for 20,000 synthetic connections, before and
               after draining one of four backends (Pearson chi-square)
   reaper      duration of one user-space expiry pass over 60,000 entries/table
@@ -36,6 +38,7 @@ from sdn.dataplane import DataPlane, FirewallRule, Timeouts
 from sdn.loader import LoadedObject, build, unpin_maps
 from testbed import packets as P
 from testbed.aggregate import summarize
+from testbed.rules import background_rules
 
 C1, S1, S2, S3, VIP = "10.0.1.1", "10.0.2.1", "10.0.2.2", "10.0.2.3", "10.100.0.1"
 BACKENDS = [S1, S2, S3, "10.0.2.4"]
@@ -46,32 +49,9 @@ def rand_ip(rng: random.Random) -> str:
     return f"172.{rng.randint(16, 31)}.{rng.randint(0, 255)}.{rng.randint(1, 254)}"
 
 
-def rand_mac(rng: random.Random) -> str:
-    return "02:" + ":".join(f"{rng.randint(0, 255):02x}" for _ in range(5))
-
-
-def random_rules(n: int, seed: int = 1) -> list[FirewallRule]:
-    """n non-matching rules, cycling through all ten patterns."""
-    rng = random.Random(seed)
-    shapes = [
-        lambda: FirewallRule(src_mac=rand_mac(rng), dst_mac=rand_mac(rng)),
-        lambda: FirewallRule(src_mac=rand_mac(rng)),
-        lambda: FirewallRule(src=rand_ip(rng), dst=rand_ip(rng), proto="tcp",
-                             sport=rng.randint(1, 65535), dport=rng.randint(1, 65535)),
-        lambda: FirewallRule(src=rand_ip(rng), dst=rand_ip(rng), proto="tcp",
-                             dport=rng.randint(1, 65535)),
-        lambda: FirewallRule(src=rand_ip(rng), dst=rand_ip(rng), proto="udp",
-                             sport=rng.randint(1, 65535)),
-        lambda: FirewallRule(src=rand_ip(rng), dst=rand_ip(rng), proto="icmp"),
-        lambda: FirewallRule(src=rand_ip(rng), dst=rand_ip(rng)),
-        lambda: FirewallRule(dst=rand_ip(rng), proto="tcp", dport=rng.randint(1, 65535)),
-        lambda: FirewallRule(src=rand_ip(rng)),
-        lambda: FirewallRule(dst=rand_ip(rng)),
-    ]
-    rules = [shapes[i % len(shapes)]() for i in range(n)]
-    for r in rules:
-        r.action = "allow"  # never matched anyway; ALLOW avoids per-rule conntrack flushes
-    return rules
+def random_rules(n: int) -> list[FirewallRule]:
+    """n non-matching rules over all ten patterns; ALLOW avoids conntrack flushes."""
+    return background_rules(n, seed=1, action="allow")
 
 
 def fill_conntrack(dp: DataPlane, n: int, seed: int = 2) -> None:
@@ -87,6 +67,8 @@ def fill_conntrack(dp: DataPlane, n: int, seed: int = 2) -> None:
 
 
 CHAIN = ["xdp_chain_fw", "xdp_chain_lb", "xdp_chain_out"]
+CHAINM = ["xdp_chainm_fw", "xdp_chainm_lb", "xdp_chainm_out"]
+COLD_FLOWS = [1_000, 15_000, 60_000]
 
 
 def reset(dp: DataPlane) -> None:
@@ -143,28 +125,43 @@ def uniformity(obj: LoadedObject, dp: DataPlane, n: int) -> dict:
                             "dof": len(after) - 1}}
 
 
+def cold_cache(obj: LoadedObject, dp: DataPlane, flows: int, calls: int) -> dict:
+    """Single-shot cost when `flows` tracked flows are visited in random order."""
+    reset(dp)
+    frames = [P.build(client_ip(i), S2, 1024 + i % 60000, 22, tcp_flags=0x10)
+              for i in range(flows)]
+    for f in frames:  # create their connection and telemetry state
+        obj.test_run(f)
+    order = random.Random(7).choices(range(flows), k=calls)
+    return single_shot(obj, lambda i: frames[order[i]], calls)
+
+
 def bench_hook(hook: str, quick: bool) -> dict:
     repeat, trials, calls = (20_000, 5, 2_000) if quick else (200_000, 15, 20_000)
-    flows = 6_000 if quick else 60_000
+    scale = 10 if quick else 1
     rule_counts = [0, 10, 100, 1000, 10_000]
     ct_counts = [0, 1000, 10_000, 60_000]
     pin_dir = f"/sys/fs/bpf/sdn_microbench_{hook}_{os.getpid()}"
-    programs = [f"{hook}_dataplane"] + (CHAIN if hook == "xdp" else [])
+    programs = [f"{hook}_dataplane"] + (CHAIN + CHAINM if hook == "xdp" else [])
     obj = LoadedObject(hook, pin_dir=pin_dir, programs=programs)
     if hook == "xdp":
         obj.fill_prog_array("chain_progs", CHAIN)
+        obj.fill_prog_array("chainm_progs", CHAINM)
     dp = DataPlane.open(pin_dir)
     plain = P.build(C1, S2, 40000, 22, tcp_flags=0x10)
-    res: dict = {"hook": hook, "repeat": repeat, "trials": trials, "calls": calls,
-                 "flows": flows}
-    log = lambda name, st: print(f"  [{hook}] {name:<26} {st['mean']:7.1f} ns", flush=True)  # noqa
+    res: dict = {"hook": hook, "repeat": repeat, "trials": trials, "calls": calls}
+    log = lambda name, st: print(f"  [{hook}] {name:<28} {st['mean']:7.1f} ns", flush=True)  # noqa
     try:
         reset(dp)
+        # Warm-up: the first samples after loading ran slower (JIT'ed code and
+        # maps not yet in the caches, branch predictors cold).
+        for _ in range(5):
+            obj.test_run(plain, repeat)
+
         res["rules"] = {}
         installed = 0
         for n in rule_counts:
-            for rule in random_rules(n)[installed:]:
-                dp.firewall.add(rule)
+            dp.firewall.add_many(random_rules(n)[installed:])
             installed = n
             res["rules"][n] = repeated(obj, plain, repeat, trials)
             log(f"rules={n}", res["rules"][n])
@@ -173,27 +170,23 @@ def bench_hook(hook: str, quick: bool) -> dict:
         res["conntrack"] = {}
         filled = 0
         for n in ct_counts:
-            fill_conntrack(dp, n - filled, seed=n)
+            fill_conntrack(dp, (n - filled) // scale, seed=n)
             filled = n
             res["conntrack"][n] = repeated(obj, plain, repeat, trials)
             log(f"conntrack={n}", res["conntrack"][n])
 
-        # cache-cold: cycle through many distinct tracked flows (single-shot)
         reset(dp)
-        frames = [P.build(client_ip(i), S2, 1024 + i % 60000, 22, tcp_flags=0x10)
-                  for i in range(flows)]
-        for f in frames:  # create their connection state
-            obj.test_run(f)
-        order = random.Random(7).choices(range(flows), k=calls)
-        res["cold"] = {
-            "one_flow": single_shot(obj, lambda i: frames[0], calls),
-            "many_flows": single_shot(obj, lambda i: frames[order[i]], calls),
-        }
-        log("one flow (single-shot)", res["cold"]["one_flow"])
-        log(f"{flows} flows (single-shot)", res["cold"]["many_flows"])
+        one = P.build(client_ip(0), S2, 1024, 22, tcp_flags=0x10)
+        obj.test_run(one)
+        res["cold"] = {"one_flow": single_shot(obj, lambda i: one, calls)}
+        log("cold: one flow", res["cold"]["one_flow"])
+        for flows in COLD_FLOWS:
+            res["cold"][str(flows)] = cold_cache(obj, dp, flows // scale, calls)
+            log(f"cold: {flows} flows", res["cold"][str(flows)])
 
         reset(dp)
         dp.lb.add_service(VIP, 80, BACKENDS)
+        dp.lb.add_service(VIP, 80, BACKENDS, "udp")
         dp.firewall.add(FirewallRule(src=C1, dst=S3, proto="tcp", dport=22))
         backend = P.parse(obj.test_run(P.build(C1, VIP, 50000, 80))[1]).dst_ip
         paths = {
@@ -201,6 +194,8 @@ def bench_hook(hook: str, quick: bool) -> dict:
             "fw_drop": lambda i: P.build(C1, S3, 40000, 22, tcp_flags=0x10),
             "dnat_established": lambda i: P.build(C1, VIP, 50000, 80, tcp_flags=0x10),
             "dnat_new": lambda i: P.build(client_ip(i), VIP, 1024 + i % 60000, 80),
+            "dnat_new_udp": lambda i: P.build(client_ip(i), VIP, 1024 + i % 60000, 80,
+                                              proto=P.UDP),
             "snat_established": lambda i: P.build(backend, C1, 80, 50000, tcp_flags=0x10),
         }
         res["paths"] = {}
@@ -213,17 +208,18 @@ def bench_hook(hook: str, quick: bool) -> dict:
         log("drop (repeat loop)", res["fw_drop_repeated"])
 
         if hook == "xdp":
-            fw = "xdp_chain_fw"
-            res["chain"] = {
-                "pass_repeated": repeated(obj, paths["pass"](0), repeat, trials, fw),
-                "drop_repeated": repeated(obj, paths["fw_drop"](0), repeat, trials, fw),
-                "dnat_established": single_shot(obj, paths["dnat_established"], calls,
-                                                program=fw),
-                "snat_established": single_shot(obj, paths["snat_established"], calls,
-                                                program=fw),
-            }
-            for name, st in res["chain"].items():
-                log(f"chain {name}", st)
+            for variant, entry in (("chain", "xdp_chain_fw"), ("chainm", "xdp_chainm_fw")):
+                res[variant] = {
+                    "pass_repeated": repeated(obj, paths["pass"](0), repeat, trials, entry),
+                    "drop_repeated": repeated(obj, paths["fw_drop"](0), repeat, trials, entry),
+                    "pass": single_shot(obj, paths["pass"], calls, program=entry),
+                    "dnat_established": single_shot(obj, paths["dnat_established"], calls,
+                                                    program=entry),
+                    "snat_established": single_shot(obj, paths["snat_established"], calls,
+                                                    program=entry),
+                }
+                for name, st in res[variant].items():
+                    log(f"{variant} {name}", st)
 
         reset(dp)
         res["uniformity"] = uniformity(obj, dp, 2_000 if quick else 20_000)
@@ -234,6 +230,7 @@ def bench_hook(hook: str, quick: bool) -> dict:
 
         if hook == "xdp":
             reset(dp)
+            flows = 60_000 // scale
             fill_conntrack(dp, flows, seed=99)
             start = time.perf_counter()
             dp.conntrack.expire(Timeouts(idle=3600, fin=3600))

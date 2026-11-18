@@ -113,6 +113,16 @@ class PatternMaskTest(unittest.TestCase):
         dp.firewall.flush()
         self.assertEqual(mask(), 0)
 
+    def test_bulk_install_populates_all_ten_patterns(self):
+        from testbed.rules import background_rules, pattern_of
+        dp = new_dp()
+        rules = background_rules(100)
+        self.assertEqual({pattern_of(r) for r in rules}, set(range(1, 11)))
+        dp.firewall.add_many(rules)
+        self.assertEqual(dp.config.get().pattern_mask,
+                         sum(1 << m for m in FwMask if m.value <= 10))
+        self.assertEqual(len(dp.firewall.list()), 100)
+
 
 class ConfigTest(unittest.TestCase):
     def test_apply_only_changes_given_settings(self):
@@ -142,6 +152,36 @@ class LoadBalancerTest(unittest.TestCase):
         b = dp.lb.add_service("10.100.0.2", 443, ["10.0.2.1"])
         self.assertEqual(dp.lb.add_service(VIP, 80, ["10.0.2.4"]), a)
         self.assertNotEqual(a, b)
+
+    def test_replacing_a_service_keeps_backend_slots(self):
+        dp = new_dp()
+        sid = dp.lb.add_service(VIP, 80, ["10.0.2.1", "10.0.2.2", "10.0.2.3"])
+        dp.lb.add_service(VIP, 80, ["10.0.2.3", "10.0.2.4"])   # s1, s2 removed; s4 added
+        backends = dp.maps["lb_backends"]
+        ips = [backends.lookup(ct.c_uint32(sid * 16 + i)).ip for i in range(3)]
+        # s3 stays in slot 2 (its connections stay valid); s4 takes the first free slot
+        self.assertEqual(ips, [ip_to_wire("10.0.2.4"), 0, ip_to_wire("10.0.2.3")])
+        ep = dp.maps["lb_endpoints"].lookup(abi.EndpointKey(
+            ip=ip_to_wire("10.0.2.3"), port=port_to_wire(80), proto=6))
+        self.assertEqual(ep.be_idx, 2)
+        self.assertEqual([b["ip"] for b in dp.lb.list()[0]["backends"]],
+                         ["10.0.2.4", "10.0.2.3"])
+
+    def test_removed_backend_state_is_flushed(self):
+        dp = new_dp()
+        dp.lb.add_service(VIP, 80, ["10.0.2.1", "10.0.2.2"])
+        for be, cport in (("10.0.2.1", 1001), ("10.0.2.2", 1002)):
+            dp.maps["lb_conntrack"].update(flow_key("10.0.1.1", VIP, cport, 80, 6), abi.LbCt(
+                backend_ip=ip_to_wire(be), backend_port=port_to_wire(80)))
+            dp.maps["lb_reverse"].update(flow_key(be, "10.0.1.1", 80, cport, 6),
+                                         abi.LbRev(vip=ip_to_wire(VIP), vport=port_to_wire(80)))
+        dp.lb.add_service(VIP, 80, ["10.0.2.2"])
+        self.assertEqual([wire for wire in (k.sport for k in dp.maps["lb_conntrack"].keys())],
+                         [port_to_wire(1002)])
+        self.assertEqual([k.saddr for k in dp.maps["lb_reverse"].keys()], [ip_to_wire("10.0.2.2")])
+        dp.lb.delete_service(VIP, 80)
+        self.assertEqual(dp.maps["lb_conntrack"].keys(), [])
+        self.assertEqual(dp.maps["lb_reverse"].keys(), [])
 
     def test_drain_and_restore(self):
         dp = new_dp()
@@ -259,6 +299,16 @@ class ConntrackExpiryTest(unittest.TestCase):
             created_ns=self.now - 100 * SEC, last_seen_ns=self.now - 100 * SEC))
         self.dp.conntrack._fw = RefreshingMap(self.dp.maps["fw_conntrack"], self.now)
         self.assertEqual(self.dp.conntrack.expire(self.t, self.now)["fw_conntrack"], 0)
+
+    def test_refreshed_reverse_entry_survives_its_partner(self):
+        """The reaper judges the reverse entry on its own when deleting the pair."""
+        self._lb_conn(1002, self.now - 31 * SEC)
+        rev = flow_key(S2, C1, 80, 1002, 6)
+        self.dp.maps["lb_reverse"].update(rev, abi.LbRev(vip=ip_to_wire(VIP),
+                                                         last_seen_ns=self.now))
+        removed = self.dp.conntrack.expire(self.t, now_ns=self.now)
+        self.assertEqual((removed["lb_conntrack"], removed["lb_reverse"]), (1, 0))
+        self.assertEqual(len(self.dp.maps["lb_reverse"].keys()), 1)
 
     def test_hard_timeout(self):
         key = flow_key(C1, S2, 5, 6, 6)

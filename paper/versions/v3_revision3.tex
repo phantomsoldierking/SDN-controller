@@ -1,0 +1,1630 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% Based on the IEEE conference template (Overleaf: "IEEE Conference Template").
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{capt-of}
+\usepackage{url}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{\sc e}\kern-.125emX}}
+
+% Shared bar-chart style for the benchmark figures
+\pgfplotsset{benchbar/.style={
+    ybar, width=\columnwidth, height=3.9cm, bar width=10pt,
+    symbolic x coords={XDP,TC,TC+FIB,Kernel,nft+IPVS,OVS,OVS-ct}, xtick=data,
+    ymin=0, enlarge x limits=0.13, axis lines*=left,
+    ymajorgrids, grid style={gray!25},
+    nodes near coords, every node near coord/.append style={font=\scriptsize},
+    tick label style={font=\scriptsize}, label style={font=\footnotesize}}}
+
+\ifdefined\pdfinfo
+\pdfinfo{
+  /Title (In-Kernel Programmable Data Planes for SDN: An eBPF/XDP Gateway with Stateful Firewalling and L4 Load Balancing Compared with Open vSwitch)
+  /Subject (SDN data plane; eBPF/XDP gateway evaluation with supplementary figures)
+  /Keywords (SDN, eBPF, XDP, load balancing, stateful firewall, Open vSwitch, nftables, IPVS)
+}
+\fi
+
+\begin{document}
+
+\title{In-Kernel Programmable Data Planes for SDN:\\
+An eBPF/XDP Gateway with Stateful Firewalling and\\
+L4 Load Balancing Compared with Open vSwitch}
+
+% \author{\IEEEauthorblockN{Team 0}
+% \IEEEauthorblockA{\textit{Department of Computer Science and Engineering} \\
+% \textit{Indian Institute of Information Technology Dharwad}\\
+% Dharwad, India \\
+% patilyogeshgouda@gmail.com}}
+
+\maketitle
+
+\begin{abstract}
+Software-Defined Networking (SDN) classically separates a controller from
+switches that execute OpenFlow match--action tables. Cloud-native platforms
+increasingly move this data plane into the operating-system kernel using the
+extended Berkeley Packet Filter (eBPF) and the eXpress Data Path (XDP). This
+paper designs, formally specifies, implements and evaluates such a data plane
+for a gateway that combines a stateful firewall, a Layer-4 load balancer with
+destination and source network address translation (DNAT/SNAT) and graceful
+backend draining, and per-flow telemetry, in a single verified eBPF program
+attachable at the XDP or the Traffic Control (TC) hook. A Python control plane
+programs it at runtime through pinned BPF maps and a REST interface and
+expires connection state like OpenFlow timeouts. The firewall judges
+load-balanced traffic by the flow the client sees, which keeps VIP policies
+consistent in both directions and keeps backends unreachable except through
+the VIP. The implementation passes 129 of 130 automated unit and kernel tests
+(one skipped by a kernel test-harness limitation), including packet tests
+that check every rewritten checksum. We compare it with plain kernel routing,
+nftables with connection tracking and IPVS, nftables with its software
+flowtable fast path, and Open vSwitch (OVS) with stateless OpenFlow~1.3 rules
+and with connection tracking, over 10 interleaved, CPU-pinned rounds on
+emulated veth links, on a routed path and through the load balancer, with
+empty and with populated rule tables. All stateful configurations provide the
+required functions and spread load evenly. With empty rule tables, the eBPF
+data plane at the TC hook is statistically indistinguishable from OVS with
+connection tracking and delivers 18\% more routed TCP throughput than
+nftables with IPVS, but the kernel's flowtable fast path, which serves
+established flows with one lookup, outperforms every eBPF configuration,
+which are 11--25\% slower. With 1000 rules populating all ten rule patterns, the eBPF
+data plane loses 11--16\% of routed TCP throughput, while OVS and the
+flowtable, which evaluate rules only when a flow is set up, lose nothing
+measurable. In-kernel microbenchmarks show a per-packet cost of 68--79~ns
+with empty rule tables, independent of the number of tracked connections
+(0--60\,000), and 224--270~ns with all ten patterns populated, independent of
+the number of rules (10--10\,000); visiting 15\,000 flows in random order raises it to
+0.29--0.52~$\mu$s. Splitting the pipeline into tail-called programs costs
+30--40\% more on the pass and DNAT paths when state is cold, and nothing
+measurable when it is cached.
+\end{abstract}
+
+\begin{IEEEkeywords}
+software-defined networking, eBPF, XDP, programmable data plane, load
+balancing, stateful firewall, Open vSwitch, Mininet
+\end{IEEEkeywords}
+
+%=====================================================================
+\section{Introduction}
+%=====================================================================
+SDN decouples the control plane, which decides how traffic should be handled,
+from the data plane, which applies those decisions packet by packet
+\cite{kreutz2015sdn,feamster2014road}. OpenFlow \cite{mckeown2008openflow}
+standardized this split: a controller installs prioritized match--action
+entries into the flow tables of switches such as Open vSwitch (OVS)
+\cite{pfaff2015ovs}. The standard model is expressive for stateless
+forwarding; stateful functions such as connection tracking and NAT are
+provided through extensions, e.g., the \texttt{ct} and \texttt{nat} actions
+of OVS backed by the kernel's connection tracker.
+
+Cloud-native infrastructures have taken a different path. eBPF allows verified
+programs to be loaded into a running Linux kernel and attached to networking
+hooks, and XDP runs such programs in the network driver before the kernel
+allocates its packet structure \cite{hoiland2018xdp,vieira2020ebpf}.
+Production systems such as Cilium \cite{cilium} and Katran \cite{katran}, and
+research frameworks such as Polycube \cite{miano2021polycube}, implement their
+data planes this way. The controller--switch boundary of SDN thus becomes a
+boundary between a user-space agent and kernel tables (BPF maps).
+
+This paper does not claim the first eBPF implementation of a firewall or load
+balancer---prior systems provide these functions (Section~\ref{sec:related}). Instead it
+contributes a compact, \emph{formally specified} gateway pipeline and a
+like-for-like comparison against the stateful alternatives available on the
+same kernel. Our contributions are:
+\begin{enumerate}
+\item A single eBPF pipeline, attachable at the XDP or TC hook without
+tail-call chaining (which in our ablation saves 30--40\% of the cold-cache
+per-packet cost on the pass and DNAT paths and nothing measurable when state
+is cached), that parses Ethernet/VLAN/ARP/IPv4/TCP/UDP/ICMP, enforces
+a stateful firewall over MAC and IPv4 rules, load-balances connections to a
+virtual IP (VIP) with DNAT/SNAT and graceful backend draining, and maintains
+per-flow telemetry (Section~\ref{sec:method}).
+\item A formal model of rule matching, stateful admission over the
+client-visible flow, backend selection, NAT state coupling, checksum
+maintenance and connection expiry, which is exactly the logic the
+implementation executes (Section~\ref{sec:model}).
+\item A libbpf-based control plane with a CLI, a REST API and a connection
+reaper analogous to OpenFlow idle and hard timeouts.
+\item An evaluation against five baselines---plain kernel routing, the
+kernel's native stateful subsystems (nftables with connection tracking and
+IPVS, and nftables with its flowtable fast path), stateless OpenFlow~1.3 on
+OVS, and OVS with connection tracking---with 130 automated tests, repeated
+and interleaved benchmark runs on a routed path and through the load
+balancer, with empty and populated rule tables and paired confidence
+intervals, and in-kernel
+microbenchmarks of per-packet cost versus rule count, connection-table
+occupancy and cache state, including a tail-call ablation (Sections~\ref{sec:setup}--\ref{sec:results}).
+\end{enumerate}
+
+%=====================================================================
+\section{Related Work}
+\label{sec:related}
+%=====================================================================
+\textit{SDN, OpenFlow and OVS.} Kreutz \textit{et al.}\ survey the SDN
+architecture and its data-plane abstractions \cite{kreutz2015sdn}; Feamster
+\textit{et al.}\ trace its history \cite{feamster2014road}. OpenFlow
+\cite{mckeown2008openflow} defines the match--action switch model that OVS
+\cite{pfaff2015ovs} implements with a user-space slow path and a kernel flow
+cache; P4 \cite{bosshart2014p4} generalizes the data plane to
+protocol-independent pipelines. Tu \textit{et al.}\ revisit the OVS data path
+after ten years, including its eBPF and \texttt{AF\_XDP} variants \cite{tu2021ovs}, and
+Oko extends OVS with stateful BPF filters placed in the OpenFlow pipeline
+\cite{chaignon2018oko}.
+
+\textit{eBPF and XDP network functions.} H{\o}iland-J{\o}rgensen
+\textit{et al.}\ present the design of XDP \cite{hoiland2018xdp}, and Vieira
+\textit{et al.}\ survey eBPF and XDP \cite{vieira2020ebpf}. Miano
+\textit{et al.}\ report lessons from building network services with eBPF
+\cite{miano2018creating}, build bpf-iptables, which reproduces iptables
+semantics with an eBPF classifier \cite{miano2019bpfiptables}, and generalize
+these ideas in Polycube, a framework of chained eBPF network functions
+(firewall, NAT, load balancer, router) with a REST control plane
+\cite{miano2021polycube}. Scholz \textit{et al.}\ quantify eBPF packet
+filtering in Linux \cite{scholz2018filtering}. Cilium \cite{cilium} and Katran
+\cite{katran} are production eBPF data planes for Kubernetes networking and L4
+load balancing.
+
+\textit{Kernel subsystems and classification.} Linux provides stateful
+filtering through Netfilter/nftables with the \texttt{nf\_conntrack}
+connection tracker \cite{nftables} and L4 load balancing through IPVS
+\cite{zhang2000lvs}. Its software \emph{flowtable} (\texttt{nf\_flow\_table})
+offloads established connections, including their NAT bindings, to the
+ingress hook, where their packets bypass routing and the forward chain
+\cite{nfflowtable}---the kernel's own counterpart of in-program FIB
+forwarding, which we therefore include as a baseline. Maglev \cite{eisenbud2016maglev} introduced consistent
+hashing for software load balancers. Tuple Space Search
+\cite{srinivasan1999tss} classifies packets by probing one exact-match hash
+table per combination of wildcarded fields; our rule matcher is a fixed tuple
+space with ten tuples (Section~\ref{sec:rules}).
+
+\textit{Positioning.} Compared with Polycube and bpf-iptables, which favor
+generality (arbitrary rule sets, chains of independent programs), our design
+keeps all functions in one program and one set of maps, specifies their
+interaction formally---in particular how firewall state, NAT state and
+draining interact---and evaluates the result against the kernel's own
+stateful subsystems and a stateful OVS configuration rather than only against
+stateless forwarding. Merging network functions into one program is a
+known optimization: KFuse merges chained eBPF programs after verification
+\cite{kuo2022kfuse}, and Morpheus specializes data-plane code at run time to
+the installed rules and traffic \cite{miano2022morpheus}; modular frameworks
+also pass parsed metadata between stages instead of re-parsing. We choose a
+single program primarily because one set of maps makes the coupling of
+firewall and NAT state easy to specify and keep consistent, and we quantify
+the performance effect with an ablation that chains the same stages by tail
+calls, both with re-parsing and with shared parse metadata
+(Section~\ref{sec:kernel-cost}). We do not benchmark Polycube, bpf-iptables,
+KFuse or Morpheus themselves, which also differ in parsing, state layout and
+rule semantics. Mininet \cite{lantz2010mininet} is used for emulation;
+because emulated hosts share one kernel, the eBPF program under test is the
+real kernel program.
+
+%=====================================================================
+\section{Problem Scenario and System Model}
+\label{sec:model}
+%=====================================================================
+\subsection{Scenario}
+A gateway connects a client subnet $\mathcal{C}=\{c_1,\dots,c_4\}$
+(10.0.1.0/24) and a backend subnet $\mathcal{S}=\{s_1,\dots,s_4\}$
+(10.0.2.0/24). A service is published at the VIP $v=10.100.0.1$, port 80, and
+must be served by the backends. The gateway must (i) forward all inter-host
+traffic, (ii) enforce operator-defined allow/drop rules, (iii) distribute new
+connections to the VIP across healthy backends while keeping each connection
+on one backend, (iv) let operators drain a backend without breaking its
+established connections, and (v) export packet and byte counters. Rules and
+backend pools change at runtime without reloading the data plane.
+
+\subsection{System Model}
+Fig.~\ref{fig:arch} shows the architecture. Every host has a dedicated veth
+link to the gateway (\textit{routed access}: /32 host routes and proxy ARP),
+so every packet between any two hosts traverses the gateway data plane. The
+data plane is a set of kernel functions sharing eleven BPF maps; the control
+plane reads and writes the same maps through the \texttt{bpf()} system call.
+Table~\ref{tab:maps} maps the formal symbols used below to the maps.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\scriptsize, node distance=2mm,
+  box/.style={draw, rounded corners=1pt, align=center, minimum height=5mm, fill=white},
+  stage/.style={draw, fill=blue!7, minimum height=5.5mm, minimum width=6mm, inner sep=1.5pt, align=center},
+  arr/.style={-{Stealth[length=1.6mm]}}]
+\node[box, text width=0.86\columnwidth] (cp) {\textbf{Control plane} (Python, user space):
+  CLI $\cdot$ REST API $\cdot$ connection reaper $\cdot$ libbpf loader};
+\node[box, below=4mm of cp, text width=0.86\columnwidth] (maps)
+  {BPF maps: \texttt{firewall\_map}, \texttt{fw\_conntrack}, \texttt{lb\_services},
+   \texttt{lb\_backends}, \texttt{lb\_active},\\ \texttt{lb\_endpoints},
+   \texttt{lb\_conntrack}, \texttt{lb\_reverse}, \texttt{flow\_stats},
+   \texttt{global\_stats}, \texttt{dp\_config\_map}};
+\node[stage, below=6mm of maps.south west, anchor=north west, xshift=0mm] (p) {Parse};
+\node[stage, right=of p] (r) {Classi-\\fy reply};
+\node[stage, right=of r] (f) {Fire-\\wall};
+\node[stage, right=of f] (l) {L4\\LB};
+\node[stage, right=of l] (c) {Conn.\\track};
+\node[stage, right=of c] (t) {Count};
+\node[stage, right=of t] (n) {NAT};
+\draw[arr] (p) -- (r); \draw[arr] (r) -- (f); \draw[arr] (f) -- (l); \draw[arr] (l) -- (c);
+\draw[arr] (c) -- (t); \draw[arr] (t) -- (n);
+\begin{scope}[on background layer]
+\node[draw, dashed, fill=gray!5, inner sep=2mm, fit=(p)(n),
+  label={[font=\scriptsize]below:\textbf{Data plane} (kernel): XDP or TC hook on gw-eth0..7}] (dp) {};
+\end{scope}
+\draw[arr, <->] (cp) -- node[right] {\texttt{bpf()} syscalls on pinned maps} (maps);
+\draw[arr, <->] (maps.south) -- (maps.south |- dp.north);
+\end{tikzpicture}
+\caption{Architecture: a user-space control plane programs a kernel data
+plane through shared BPF maps. ``Classify reply'' determines the rule key
+(Eq.~(\ref{eq:kappa})) without changing state; ``L4 LB'' updates
+$\mathcal{L}$ and $\mathcal{T}_{rev}$ only for admitted packets; ``Conn.\
+track'' is the update of $\mathcal{T}_{fw}$ and ``NAT'' the header rewrite
+(Algorithm~\ref{alg:pipeline}).}
+\label{fig:arch}
+\end{figure}
+
+\begin{table}[t]
+\caption{Formal symbols and their BPF maps (capacity in entries; the
+per-service arrays hold 16 services $\times$ 16 slots)}
+\label{tab:maps}
+\centering\scriptsize
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{@{}llrl@{}}
+\toprule
+Symbol & Map (type) & Cap. & Content \\
+\midrule
+$\mathcal{R}$ & \texttt{firewall\_map} (hash) & 16\,384 & (pattern id, fields) $\mapsto$ action, hits \\
+$\mathcal{T}_{fw}$ & \texttt{fw\_conntrack} (LRU hash) & 65\,536 & tracked flows, times, TCP flags \\
+$\sigma$ & \texttt{lb\_services} (hash) & 16 & $(v,p_v,\pi) \mapsto$ id, $n$, $n_{\mathrm{act}}$ \\
+$B_\sigma$, $\alpha$ & \texttt{lb\_backends} (array) & 256 & address, port, active flag \\
+$\lambda$ & \texttt{lb\_active} (array) & 256 & indices of active backends \\
+$\mathcal{E}$ & \texttt{lb\_endpoints} (hash) & 256 & $(a_b,p_b,\pi) \mapsto (v,p_v,\sigma,j)$ \\
+$\mathcal{L}$ & \texttt{lb\_conntrack} (LRU hash) & 65\,536 & client flow $\mapsto (b,j)$ \\
+$\mathcal{T}_{rev}$ & \texttt{lb\_reverse} (LRU hash) & 65\,536 & reply key $\mapsto (v,p_v,\sigma,j)$ \\
+-- & \texttt{flow\_stats} (per-CPU LRU) & 16\,384 & per-flow packets, bytes \\
+-- & \texttt{global\_stats} (per-CPU array) & 15 & pipeline counters \\
+$\delta$, $\gamma$ & \texttt{dp\_config\_map} (array) & 1 & default action, flags, pattern mask \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Flows and Rules}
+\label{sec:rules}
+An IPv4 packet $x$ carries the flow key
+\begin{equation}
+f(x) = (s, d, p_s, p_d, \pi),
+\end{equation}
+with addresses $s,d$, ports $p_s,p_d$ and protocol $\pi$. Let $\rho(x)=1$ iff
+$x$ is TCP or UDP and is not an IPv4 fragment (neither the More-Fragments flag
+nor a fragment offset is set), i.e., iff its ports are known; otherwise
+$p_s=p_d=0$. ICMP is therefore matched on $(s,d,\pi)$ only, and all fragments
+of a datagram share one key (Section~\ref{sec:method} discusses fragments,
+whose first fragment's ports are used only to drop it). The reverse key is $\bar f = (d, s, p_d, p_s,
+\pi)$.
+
+Rules follow ten \emph{patterns}. Pattern $i$ selects a subset of fields, and a
+rule is stored under the key $(i, m_i(\cdot))$, where $i$ is the
+\emph{pattern id}; because $i$ is part of the key, an unselected field is a
+true wildcard and a packet whose port or protocol happens to be zero can never
+match a wildcarded rule by accident. In lookup order:
+\begin{equation}
+\begin{aligned}
+&m_1{:}\,(\mathrm{mac}_s,\mathrm{mac}_d),\;\; m_2{:}\,(\mathrm{mac}_s),\;\;
+ m_3{:}\,(s,d,p_s,p_d,\pi)^{\rho},\\
+&m_4{:}\,(s,d,p_d,\pi)^{\rho},\;\; m_5{:}\,(s,d,p_s,\pi)^{\rho},\;\;
+ m_6{:}\,(s,d,\pi),\\
+&m_7{:}\,(s,d),\;\; m_8{:}\,(d,p_d,\pi)^{\rho},\;\; m_9{:}\,(s),\;\;
+ m_{10}{:}\,(d),
+\end{aligned}
+\label{eq:patterns}
+\end{equation}
+where $^{\rho}$ marks patterns that require $\rho(x)=1$. The L2 patterns
+$m_1,m_2$ are functions of the Ethernet header and apply to every frame,
+including IPv6 and other non-IP traffic; $m_3$--$m_{10}$ are functions of an
+IPv4 key. With $I_2=\{1,2\}$ and $I_4(\rho)=\{3,\dots,10\}\setminus\{i: m_i
+\text{ requires } \rho \land \rho=0\}$, the L2 and IPv4 decisions are
+\begin{equation}
+\begin{aligned}
+A_2(x) &= a\big(i^*, m_{i^*}(x)\big),\\
+i^* &= \min\{i \in I_2 : (i, m_i(x)) \in \mathcal{R}\},\\
+A(k,\rho) &= a\big(j^*, m_{j^*}(k)\big),\\
+j^* &= \min\{i \in I_4(\rho) : (i, m_i(k)) \in \mathcal{R}\},
+\end{aligned}
+\label{eq:match}
+\end{equation}
+with result $\textsc{none}$ if no pattern matches. $A$ depends on $\rho$
+as well as on $k$, because an unfragmented packet with zero ports and a
+fragment have the same key; below we write $A(k)$ for $A(k,\rho(x))$. The order is a total
+priority order, like OpenFlow priorities: where two patterns are incomparable
+in specificity ($m_4$/$m_5$, $m_9$/$m_{10}$) the earlier one wins, and an
+operator who needs the opposite outcome adds a more specific rule. An L2
+\textsc{allow} rule only exempts a frame from a broader L2 \textsc{drop}
+(e.g., an $m_1$ \textsc{allow} under an $m_2$ \textsc{drop}); whether an IPv4
+packet is admitted is decided by $A(k)$ alone, and L2 \textsc{drop} rules
+do not flush connection state, which is keyed by IPv4 tuples. Pattern $m_8$ expresses a
+service rule such as ``any client may reach $v$:80/TCP''. The data plane skips
+patterns that hold no rule; this does not change $A$.
+
+\subsection{Rule Key and Stateful Admission}
+A load-balanced connection is judged in one orientation, client$\to$VIP, in
+both directions. For a backend reply $x$ with $f(x)=(a_b,c,p_b,p_c,\pi)$,
+i.e., $(d,p_d)=(c,p_c)$, the rule key restores the client's view:
+\begin{equation}
+\kappa(x) = \begin{cases}
+(d, v, p_d, p_v, \pi) & \text{if $x$ replies to a tracked}\\
+ & \text{LB connection to } (v,p_v),\\
+f(x) & \text{otherwise}.
+\end{cases}
+\label{eq:kappa}
+\end{equation}
+Forward packets to the VIP already carry $(c, v, p_c, p_v, \pi)$, so a single
+rule against the VIP---e.g., $m_8$ ``any client may reach $v$:80''---covers
+both directions of the connection, even with the firewall's connection
+tracking disabled ($\gamma=0$), since $\kappa$ uses only the load balancer's
+tables; a rule between a client and a specific backend does not affect traffic through
+the VIP; a broader rule such as $m_{10}$: $(d{=}c)\mapsto\textsc{drop}$ does
+not hit replies, whose key has destination $v$; and no firewall state is ever
+created for a backend's real address. For VIP traffic, the patterns are
+therefore predicates on the \emph{connection} (e.g., $m_9$: $(s{=}c)$
+matches both directions, $(s{=}v)$ neither), whereas all other traffic is
+matched in the orientation in which it travels. Section~\ref{sec:coupling}
+defines when a packet is a reply of a tracked load-balanced connection.
+
+Let $\gamma\in\{0,1\}$ indicate whether connection tracking is enabled and
+$\delta$ the default action. A flow is \emph{established} iff $E(k)=1$, where
+$E(k) = \mathbb{1}\big[\gamma = 1 \land (k \in \mathcal{T}_{fw} \lor \bar k \in
+\mathcal{T}_{fw})\big]$, so $E(k)=0$ when tracking is disabled. Non-IPv4
+frames (ARP, IPv6, \dots) are admitted iff $A_2(x) \ne \textsc{drop}$,
+independently of $\delta$, so IP policy cannot break address resolution. An
+IPv4 packet with $k=\kappa(x)$ is admitted iff $A_2(x) \ne \textsc{drop}$ and
+$\mathrm{adm}(x)=1$, where
+\begin{equation}
+\mathrm{adm}(x) =
+\begin{cases}
+0 & A(k) = \textsc{drop},\\
+1 & A(k) = \textsc{allow},\\
+1 & A(k) = \textsc{none} \land \delta=\textsc{allow},\\
+E(k) & A(k) = \textsc{none} \land \delta = \textsc{drop}.
+\end{cases}
+\label{eq:adm}
+\end{equation}
+An explicit \textsc{drop} rule takes effect on the next packet in either
+direction, even on established connections; when one is added, the control
+plane additionally flushes the matching connection state. After an admitted
+packet has also passed the load balancer, and if $\gamma=1$, the tracker
+refreshes the entry of $k$ if $k\in\mathcal{T}_{fw}$, otherwise that of $\bar
+k$ if present, and otherwise inserts $k$. A packet counts as a reply if it is
+a load-balanced reply by Eq.~(\ref{eq:kappa})---its key $k$ then hits the
+client's entry directly---or if only $\bar k$ is present (routed traffic);
+a reply marks the entry as having seen a reply. Each connection thus occupies
+one entry, with one pair of timestamps and the union of the TCP flags of both
+directions; the timeout of Eq.~(\ref{eq:expiry}) needs only whether a FIN or
+RST was seen, not by whom.
+
+\subsection{Load-Balancing Model}
+A service $\sigma=(v,p_v,\pi)$ owns an ordered backend pool
+$B_\sigma=(b_0,\dots,b_{n-1})$ of size $n \le 16$, where each backend
+$b_j=(a_j, p_j)$ has an address, a port and an active flag $\alpha_j\in\{0,1\}$
+($1$: active, $0$: draining). A backend keeps its slot $j$ while it stays in
+the pool; removing one leaves an empty slot rather than shifting the others,
+because established connections refer to backends by slot.
+Let $n_{\mathrm{act}} = \sum_{j=0}^{n-1}\alpha_j$ and let
+$(\lambda_0,\dots,\lambda_{n_{\mathrm{act}}-1})$ be the indices of the active
+backends in pool order. For a new connection $f$, the gateway computes a hash
+$h(f)$ (Bob Jenkins' \textit{jhash} final mix over $s$, $d$ and the
+port/protocol word) and selects
+\begin{equation}
+j^*(f) = \lambda_{\,h(f) \bmod n_{\mathrm{act}}}
+\quad \text{if } n_{\mathrm{act}} > 0;
+\label{eq:select}
+\end{equation}
+if $n_{\mathrm{act}} = 0$, the packet is dropped. The choice is stored as
+$\mathcal{L}[f]=(b_{j^*}, j^*)$. Because the hash is taken modulo the number
+of \emph{active} backends, draining a backend spreads its share evenly over
+all remaining ones; a uniform $h$ gives every active backend an expected
+$N/n_{\mathrm{act}}$ of $N$ new connections, which we test with Pearson's
+statistic over the active backends,
+\begin{equation}
+\chi^2 = \sum_{j:\,\alpha_j=1} \frac{(N_j - N/n_{\mathrm{act}})^2}{N/n_{\mathrm{act}}},
+\qquad \text{d.o.f.} = n_{\mathrm{act}}-1,
+\label{eq:chi2}
+\end{equation}
+defined for $n_{\mathrm{act}} \ge 2$ (with one active backend the choice is
+deterministic).
+
+\textit{Stickiness and graceful draining.} For a later packet of $f$ with
+$\mathcal{L}[f]=(b,j)$, the stored backend is reused as long as slot $j$ still
+holds $b$ (same address and port), \emph{regardless of} $\alpha_j$: draining
+($\alpha_j \gets 0$) removes $b_j$ from Eq.~(\ref{eq:select}) for new
+connections only, while established connections continue until they close or
+expire. Only if the backend was removed or replaced is $f$ re-selected; the
+old backend's reverse entry $\mathcal{T}_{rev}[r_{b}(f)]$ is deleted first.
+When a backend is removed or replaced, the control plane also flushes every
+$\mathcal{L}$ and $\mathcal{T}_{rev}$ entry that names it, so no state
+survives for a slot that now holds another backend.
+
+\subsection{Address Translation, State Coupling and Recovery}
+\label{sec:coupling}
+For a client flow $f=(c,v,p_c,p_v,\pi)$ assigned to backend $b=(a_b,p_b)$, the
+forward packet is rewritten by DNAT, $T_D(f)=(c,a_b,p_c,p_b,\pi)$, and the
+reverse-NAT table records the key of the expected reply,
+$\mathcal{T}_{rev}[r_b(f)] = (v,p_v,\sigma,j^*)$ with
+$r_b(f)=(a_b,c,p_b,p_c,\pi)$; we write $r(f)$ when $b$ is the backend of
+$\mathcal{L}[f]$. A reply matching this key is rewritten by SNAT to
+$(v,c,p_v,p_c,\pi)$, so the client only ever observes the VIP.
+
+\textit{Isolation.} A backend \emph{service endpoint} $(a_b,p_b,\pi)$ belongs
+to exactly one service (the control plane rejects overlapping pools, per
+address, port and protocol) and is reachable only through its VIP: a packet
+addressed directly to a service endpoint is dropped, and so is the first
+fragment of a datagram to or from one (Section~\ref{sec:method}). Hence no un-translated
+connection can produce a key $r(f)$, and $\mathcal{T}_{rev}$ is injective. An
+index $\mathcal{E}[(a_b,p_b,\pi)] = (v,p_v,\sigma,j)$ records each endpoint's
+service.
+
+\textit{Coupling and recovery.} $\mathcal{L}[f]$ and $\mathcal{T}_{rev}[r(f)]$
+live in separate LRU maps and either can be lost to eviction or a reaper race
+(Section~\ref{sec:reaper}). Each packet therefore refreshes both entries and
+rebuilds a missing one from the other. Reply classification, which
+determines $\kappa(x)$ before the firewall runs, is read-only; entries are
+refreshed or re-created only after the packet has been admitted, so a packet
+that the firewall drops never creates NAT state:
+\begin{itemize}
+\item a forward packet refreshes $\mathcal{L}[f]$ in place and refreshes or
+re-creates $\mathcal{T}_{rev}[r(f)]$. If $\mathcal{L}[f]$ is missing and the
+packet is not a TCP SYN, it probes $\mathcal{T}_{rev}[r_{b_i}(f)]$ for
+$0 \le i < n$ (at most 16 lookups) and, on a hit recorded for slot $i$,
+restores $\mathcal{L}[f]$ to $b_i$---even if it is draining. A SYN always
+opens a new connection, so it is placed by Eq.~(\ref{eq:select}) and cannot
+be captured by a leftover reverse entry of an earlier connection that used
+the same client port; for UDP, which has no such signal, a leftover entry
+can bind a new flow to its old backend until the entry expires;
+\item a reply is classified as such if $\mathcal{T}_{rev}[f(x)] =
+(v,p_v,\sigma,j)$ exists, or, if it is missing, if $\mathcal{E}$ yields
+$(v,p_v,\sigma)$ and $\mathcal{L}[(c,v,p_c,p_v,\pi)] = (b,j)$ names this
+backend; in both cases slot $j$ of $B_\sigma$ must still hold $(a_b,p_b)$.
+After admission it refreshes or re-creates $\mathcal{T}_{rev}[f(x)]$ and
+refreshes $\mathcal{L}[f]$, re-creating it from $(\sigma,j)$ if missing;
+\item a packet from a service endpoint that fails these checks is dropped,
+so a backend's real address can never reach a client.
+\end{itemize}
+Both directions record TCP FIN and RST flags (client flags in the forward
+direction, server flags in replies), so either side's close shortens the
+connection's timeout, and a server-to-client download keeps the connection
+alive. A connection is lost only if both entries are lost before a packet
+rebuilds one, as with any NAT that loses state.
+
+\subsection{Incremental Checksum Maintenance}
+Rewriting addresses and ports invalidates the IPv4 header checksum and the
+TCP/UDP checksum, whose pseudo-header covers both addresses. Recomputing them
+costs $O(L)$ for a packet of length $L$. We use the incremental update of
+RFC~1624 \cite{rfc1624}: if 16-bit words $m_i$ change to $m_i'$,
+\begin{equation}
+HC' = {\sim}\Big({\sim}HC \oplus \textstyle\bigoplus_i {\sim}m_i
+\oplus \bigoplus_i m_i'\Big),
+\label{eq:csum}
+\end{equation}
+where $\oplus$ is 16-bit ones'-complement addition (end-around carry)
+\cite{rfc1071} and ${\sim}$ is bitwise complement; the cost is $O(1)$. For
+the IPv4 header the changed words are the two halves of one address; for the
+L4 checksum they are the address (via the pseudo-header) and the port. The
+implementation accumulates the sum in 32 bits with \texttt{bpf\_csum\_diff},
+folds the carries into 16 bits and complements the result. The only special
+case is UDP (RFC~768 \cite{rfc768}): a received checksum of zero (``not
+computed'') is left unchanged, and a computed UDP checksum of
+\texttt{0x0000} is transmitted as \texttt{0xFFFF}; IPv4 header and TCP
+checksums are written as computed.
+
+\subsection{Connection Expiry}
+Each tracked entry $e$ stores its creation time $\tau_c(e)$, last-seen time
+$\tau_\ell(e)$ (both from \texttt{bpf\_ktime\_get\_ns}) and the TCP flags seen
+in either direction. With the idle limit $\Theta(e) = T_{\mathrm{fin}}$ if FIN
+or RST has been seen and $T_{\mathrm{idle}}$ otherwise, the entry is removed at
+reaper time $t$ iff
+\begin{equation}
+t - \tau_\ell(e) > \Theta(e)
+\;\lor\; \big(T_{\mathrm{hard}} > 0 \,\land\, t - \tau_c(e) > T_{\mathrm{hard}}\big),
+\label{eq:expiry}
+\end{equation}
+which mirrors OpenFlow's \texttt{idle\_timeout} and \texttt{hard\_timeout}.
+Removing $\mathcal{L}[f]$ also removes $\mathcal{T}_{rev}[r(f)]$.
+
+%=====================================================================
+\section{Proposed Methodology}
+\label{sec:method}
+%=====================================================================
+\subsection{Data-Plane Pipeline}
+Algorithm~\ref{alg:pipeline} gives the per-packet processing. It is written
+once and called by both entry points (\texttt{xdp\_dataplane} and
+\texttt{tc\_dataplane}); only the final rewrite differs between hooks. Every
+header access is preceded by an explicit bounds check against the end of the
+packet, which lets the in-kernel verifier prove memory safety. Malformed
+headers (truncated, $\mathrm{IHL}<5$, inconsistent total length) are dropped.
+The parser accepts one 802.1Q/802.1ad VLAN tag. Updates of the 15 global
+counters are omitted from the algorithm for brevity.
+
+\textit{Fragments.} The gateway does not reassemble IPv4 fragments. Every
+fragment, including the first, has $\rho(x)=0$: it skips the port patterns,
+is matched on $(s,d,\pi)$, is tracked under the port-less key $(s,d,0,0,\pi)$,
+and is neither load-balanced nor NAT-rewritten, so the fragments of one
+datagram are always admitted alike. The first fragment of a TCP or UDP
+datagram carries the ports, and they are used for one purpose only:
+\emph{dropping} it, if they hit a service endpoint (isolation) or a port
+\textsc{drop} rule ($m_3$--$m_5$, $m_8$). The receiver then cannot reassemble
+the datagram, so neither isolation nor a port \textsc{drop} rule can be
+bypassed by fragmenting. Consequently (i) a port-specific \textsc{allow} rule
+admits only unfragmented traffic, and fragmented traffic needs an
+address-level rule; (ii) all fragmented TCP or UDP traffic between two hosts
+shares one connection entry, which records no TCP flags because fragments are
+not parsed beyond the IPv4 header; and (iii) load-balanced services require
+unfragmented datagrams, which TCP achieves with the DF flag and path-MTU
+discovery. ICMP errors are matched by their outer header only; their embedded
+headers are not translated, so an ICMP ``fragmentation needed'' message sent
+toward the VIP does not reach the backend, and path-MTU discovery across the
+VIP relies on equal MTUs or MSS clamping, a limitation shared by NAT devices
+without ICMP translation.
+
+\begin{algorithm}[t]
+\caption{Per-packet data-plane pipeline}
+\label{alg:pipeline}
+\begin{algorithmic}[1]
+\REQUIRE packet $x$, configuration $(\delta,\gamma,\text{flags})$
+\STATE $(f,\rho,\text{ok}) \gets \textsc{Parse}(x)$ \COMMENT{bounds-checked}
+\IF{\textbf{not} ok}
+  \RETURN \textsc{Drop} \COMMENT{malformed}
+\ENDIF
+\IF{$A_2(x) = \textsc{drop}$}
+  \RETURN \textsc{Drop} \COMMENT{L2 rules, every frame}
+\ENDIF
+\IF{$x$ is not IPv4}
+  \RETURN \textsc{Pass} \COMMENT{ARP, IPv6, \dots}
+\ENDIF
+\IF{$x$ is a first fragment \textbf{and} its ports hit $\mathcal{E}$ or a port \textsc{drop} rule}
+  \RETURN \textsc{Drop}
+\ENDIF
+\STATE $(\textit{kind}, \textit{info}) \gets \textsc{ClassifyReply}(f, \rho)$
+  \COMMENT{read-only}
+\IF{\textit{kind} = \textsc{Isolate}}
+  \RETURN \textsc{Drop}
+\ENDIF
+\STATE $k \gets \kappa(x)$ \COMMENT{Eq.~(\ref{eq:kappa})}
+\IF{$\mathrm{adm}(x)=0$ (Eq.~(\ref{eq:adm}))}
+  \RETURN \textsc{Drop}
+\ENDIF
+\STATE $\nu \gets \textsc{LoadBalance}(f, \rho, \textit{kind}, \textit{info})$ \COMMENT{Alg.~\ref{alg:lb}}
+\IF{$\nu = \textsc{Drop}$}
+  \RETURN \textsc{Drop} \COMMENT{no backend, or isolated endpoint}
+\ENDIF
+\IF{$\gamma=1$}
+  \STATE refresh $k$ or $\bar k$ in $\mathcal{T}_{fw}$, or insert $k$
+\ENDIF
+\STATE add $x$ to the per-flow counters of $f$
+\IF{$\nu$ is a DNAT or SNAT rewrite}
+  \STATE rewrite address and port; update checksums (Eq.~(\ref{eq:csum}))
+\ENDIF
+\IF{FIB forwarding enabled \textbf{and} route lookup succeeds}
+  \STATE decrement TTL, rewrite MACs, \RETURN \textsc{Redirect}(egress)
+\ENDIF
+\RETURN \textsc{Pass}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Load Balancing and NAT}
+Algorithm~\ref{alg:lb} implements Eq.~(\ref{eq:select}), graceful draining and
+the coupling and recovery rules of Section~\ref{sec:coupling};
+\textsc{ClassifyReply} in Algorithm~\ref{alg:pipeline} implements the reply
+cases of Section~\ref{sec:coupling} without modifying any map: it returns
+$\textit{info}=(v,p_v,\sigma,j)$ from $\mathcal{T}_{rev}$, or recovered from
+$\mathcal{E}$ and $\mathcal{L}$, after checking that slot $j$ still holds the
+sender, and \textsc{Isolate} for a service endpoint that fails these checks.
+Existing entries are updated in place (keeping their creation time and
+flags); only new or recovered entries are inserted. All loops are bounded by the
+constant 16, which lets the verifier prove termination. The connection tables
+are LRU hash maps with 65\,536 entries each, so they cannot fill up and stop
+admitting new connections.
+
+\begin{algorithm}[t]
+\caption{\textsc{LoadBalance}$(f, \rho, \textit{kind}, \textit{info})$, $f=(s,d,p_s,p_d,\pi)$}
+\label{alg:lb}
+\begin{algorithmic}[1]
+\IF{\textit{kind} = \textsc{Reply}}
+  \STATE $(v,p_v,\sigma,j) \gets \textit{info}$;
+         $g \gets (d, v, p_d, p_v, \pi)$ \COMMENT{client flow}
+  \STATE refresh $\mathcal{T}_{rev}[f]$, or set $\mathcal{T}_{rev}[f] \gets \textit{info}$ if missing
+  \STATE refresh $\mathcal{L}[g]$, or set $\mathcal{L}[g] \gets ((s,p_s), j)$ if missing
+  \RETURN SNAT $(s,p_s) \to (v,p_v)$
+\ENDIF
+\IF{$\rho = 0$}
+  \RETURN \textsc{None}
+\ENDIF
+\IF{$(d,p_d,\pi)$ is not a service}
+  \IF{$(d,p_d,\pi) \in \mathcal{E}$}
+    \RETURN \textsc{Drop} \COMMENT{isolation}
+  \ENDIF
+  \RETURN \textsc{None}
+\ENDIF
+\STATE let $B_\sigma=(b_0,\dots,b_{n-1})$ be the pool of $\sigma=(d,p_d,\pi)$
+\IF{$\mathcal{L}[f]=(b,j)$ exists \textbf{and} $b_j = b$}
+  \STATE refresh $\mathcal{L}[f]$; refresh or re-create $\mathcal{T}_{rev}[r_b(f)]$
+  \RETURN DNAT $(d,p_d) \to b$
+\ELSIF{$\mathcal{L}[f]=(b',j)$ exists}
+  \STATE delete $\mathcal{T}_{rev}[r_{b'}(f)]$ \COMMENT{backend replaced}
+\ELSIF{$x$ is not a TCP SYN \textbf{and} $\mathcal{T}_{rev}[r_{b_i}(f)]$ records slot $i$, for some $0 \le i < n$}
+  \STATE $\mathcal{L}[f] \gets (b_i,i)$ \COMMENT{recovery, even if draining}
+  \RETURN DNAT $(d,p_d) \to b_i$
+\ENDIF
+\STATE $(b,j) \gets \textsc{Select}(f)$ \COMMENT{Eq.~(\ref{eq:select})}
+\IF{$b = \bot$}
+  \RETURN \textsc{Drop} \COMMENT{$n_{\mathrm{act}}=0$}
+\ENDIF
+\STATE $\mathcal{L}[f] \gets (b,j)$;
+       $\mathcal{T}_{rev}[r_b(f)] \gets (v,p_v,\sigma,j)$ with $(v,p_v)=(d,p_d)$
+\RETURN DNAT $(d,p_d) \to b$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Hook-Specific Rewriting}
+At the XDP hook the program edits the packet in place. The IPv4 header
+checksum is updated with one \texttt{bpf\_csum\_diff} call over the 4-byte old
+and new address. For the TCP/UDP checksum, the program stages two contiguous
+8-byte buffers on the stack---the old address followed by the old 32-bit port
+word $(p_s,p_d)$, and the new address followed by the port word in which only
+the rewritten port changed---and passes both to a second
+\texttt{bpf\_csum\_diff} call; this works because TCP and UDP headers both
+begin with $(p_s,p_d)$, and it keeps every operand a multiple of 4 bytes.
+A UDP checksum of zero is skipped and a computed \texttt{0x0000} is written as
+\texttt{0xFFFF} (Section~III-G); the TC helpers apply the same rules when
+called with the UDP-checksum flag. At the TC hook the program uses \texttt{bpf\_l3\_csum\_replace} and
+\texttt{bpf\_l4\_csum\_replace} with the pseudo-header flag; these helpers also
+handle packets whose transport checksum has not yet been finalized because of
+checksum offload. Optional FIB forwarding queries the kernel routing table
+with \texttt{bpf\_fib\_lookup}, decrements the TTL with an incremental
+header-checksum update, rewrites both MAC addresses and redirects the packet
+to the egress interface, bypassing the IP stack; packets with
+$\mathrm{TTL}\le1$ or without a resolved neighbor are passed to the stack.
+
+\subsection{Telemetry}
+Per-flow counters live in a per-CPU LRU hash map keyed by the exact flow key
+(16\,384 entries), so flows never share an entry; when the map is full, the
+least recently used flow is evicted. Only admitted packets are counted, so a
+flood of dropped packets cannot evict legitimate flows; drops are counted in
+the global counters, which use a per-CPU array. Telemetry is keyed by the
+packet's own (pre-NAT) key $f$, not by the rule key $k$: the reply direction
+of a load-balanced connection is reported under the backend's address, which
+shows how much traffic each backend returns. Per-CPU storage avoids atomic
+operations; the control plane sums the per-CPU values when reading.
+
+\subsection{Control Plane}
+The control plane is written in Python and calls \texttt{libbpf} directly
+through \texttt{ctypes}. It compiles the program with
+\texttt{clang -O2 -target bpf}, loads it, pins all maps under
+\texttt{/sys/fs/bpf} so that every CLI call and the daemon share one state,
+and attaches the program to each gateway interface. Map layouts are mirrored as
+\texttt{ctypes} structures whose sizes are asserted against the C definitions
+at import time. Rules are validated against the ten patterns of
+Eq.~(\ref{eq:patterns}); a rule of any other shape is rejected rather than
+silently widened. After every rule change, the control plane publishes a
+10-bit mask of populated patterns, which the data plane uses to skip empty
+ones. For each service it maintains the pool with fixed slots, the list of active
+backend indices used by Eq.~(\ref{eq:select}), and the endpoint index
+$\mathcal{E}$. These are separate maps updated by separate \texttt{bpf()}
+calls, so the order matters: on a drain the backend's active flag is cleared
+first, then the list is rewritten, then $n_{\mathrm{act}}$ is lowered; on a
+restore the new list entry is written before $n_{\mathrm{act}}$ is raised. A
+concurrently running packet therefore never reads an unwritten list slot, and
+a stale slot that still names a drained backend is skipped because its flag is
+already clear. Adding an IPv4 \textsc{drop} rule ($m_3$--$m_{10}$) iterates
+over $\mathcal{T}_{fw}$, $\mathcal{L}$ and $\mathcal{T}_{rev}$ and flushes the
+entries whose client-visible addresses match it (a superset when the rule also
+names ports); an L2 \textsc{drop} rule flushes nothing and takes effect through
+$A_2$ on the next frame. Removing or replacing a backend flushes its entries
+(Section~\ref{sec:coupling}). A daemon serves a JSON REST API and runs a reaper thread
+that applies Eq.~(\ref{eq:expiry}).
+
+\textit{Reaper consistency.}
+\label{sec:reaper}
+User space cannot atomically test and delete a map entry, so the reaper
+re-reads each candidate immediately before deleting it and skips it if a
+packet refreshed it in the meantime. A window of microseconds remains, and an
+entry is only deleted after at least $\Theta(e)$ seconds without traffic.
+When an expired $\mathcal{L}[f]$ is deleted, its partner
+$\mathcal{T}_{rev}[r(f)]$ is re-read and deleted only if it has expired on its
+own, so a reply that refreshed it in the meantime keeps it. If a packet does
+arrive in the window and only one half of a load-balanced connection is
+deleted, the recovery rules of Section~\ref{sec:coupling} rebuild it,
+including for draining backends; only the deletion of both halves loses the
+connection. Routed connections have a single entry in $\mathcal{T}_{fw}$ and
+no partner to recover from; for them the window means that, under
+$\delta=\textsc{drop}$, a packet arriving in it may be dropped. In-kernel BPF timers would remove the window entirely.
+The reaper reads entries one at a time; its cost is reported in
+Section~\ref{sec:kernel-cost}.
+
+\subsection{Complexity}
+\label{sec:complexity}
+With hash maps, per-packet work is independent of the number of rules and
+tracked connections: at most two L2 and eight IPv4 rule lookups (only for
+populated patterns), a constant number of connection-table lookups, one
+lookup in the active-backend list for a new connection, and at most $n \le 16$
+reverse-entry probes when a non-SYN packet misses $\mathcal{L}$. The data
+plane cannot tell a new UDP flow from one whose forward entry was evicted, so
+every new UDP connection to a VIP pays these $n$ probes; TCP SYNs skip them. Checksum
+maintenance is $O(1)$ by Eq.~(\ref{eq:csum}). Section~\ref{sec:kernel-cost}
+measures this empirically.
+
+%=====================================================================
+\section{Baselines and Experimental Setup}
+\label{sec:setup}
+%=====================================================================
+\subsection{Configurations}
+We compare eight configurations of the gateway. Three use the proposed data
+plane:
+\begin{itemize}
+\item \textbf{XDP}: the pipeline at the XDP hook (native veth XDP); packets are
+passed to the kernel for routing.
+\item \textbf{TC}: the same pipeline at the TC ingress hook.
+\item \textbf{TC+FIB}: the TC hook with in-program forwarding via
+\texttt{bpf\_fib\_lookup} and \texttt{bpf\_redirect}.
+\end{itemize}
+FIB forwarding is not evaluated at the XDP hook: on veth, \texttt{XDP\_REDIRECT}
+delivers a frame only if the peer interface---here inside each emulated
+host---also runs an XDP program, which would change the hosts under test.
+Five are baselines. Three are stateful and implement the same policy (stateful
+firewall, VIP load balancing with DNAT/SNAT, graceful draining):
+\begin{itemize}
+\item \textbf{nft+IPVS}: the kernel's native subsystems---nftables with
+connection tracking (drop rules ahead of an established-state accept, so a
+drop rule wins over state, as in Eq.~(\ref{eq:adm})) and IPVS in NAT mode with
+Maglev hashing on address and port \cite{zhang2000lvs,nftables}; draining sets
+a backend's weight to 0. Packets follow the kernel's full forwarding path.
+\item \textbf{nft-FT}: nftables alone with the software flowtable
+\cite{nfflowtable}: the VIP is load-balanced by nftables DNAT over a
+\texttt{jhash} of the client address and port into the list of active
+backends (conntrack un-NATs the replies), and established TCP and UDP
+connections are offloaded to a flowtable at the ingress hook, so that their
+packets bypass routing and the forward chain. This is the kernel's own fast
+path and the counterpart of TC+FIB; IPVS is not used because its connections
+are not offloaded. Drop rules precede the offload rule, and adding one
+flushes the matching conntrack (and thus flowtable) entries.
+\item \textbf{OVS-ct}: OVS with connection tracking: all IP traffic passes
+\texttt{ct(nat)}; new connections to the VIP enter a \texttt{select} group
+whose buckets perform \texttt{ct(commit,nat(dst=$b$))}; other new flows are
+committed; established and related flows are routed. Draining removes the
+backend's bucket with \texttt{mod-group}, and existing connections continue
+through their conntrack NAT binding.
+\end{itemize}
+Two are stateless references:
+\begin{itemize}
+\item \textbf{Kernel}: Linux routing with the same addressing and no policy,
+i.e., the cost of forwarding alone.
+\item \textbf{OVS}: OpenFlow~1.3 rules only (firewall drops, a \texttt{select}
+group for the VIP, stateless reverse NAT that rewrites every reply from a
+backend's service port, routing). Without connection tracking it can drain
+only by re-hashing existing connections.
+\end{itemize}
+Firewall drops are counted by the data plane in every configuration that has
+a firewall: eBPF counters, the nftables rule counter, or the OpenFlow rule
+counters (synchronized from the kernel datapath before reading).
+
+\textit{Populated rule tables.} The configurations with a firewall are also
+measured with 1000 non-matching rules that populate all ten patterns of
+Eq.~(\ref{eq:patterns}) (marked ``+rules''), each in its idiomatic form: eBPF
+map entries; one nftables set per pattern, matched with concatenated keys
+ahead of the established-state accept (ten set lookups per packet, the same
+tuple space); and OpenFlow drop flows in the OVS ACL table. Addresses come
+from 172.16.0.0/12 and MAC addresses are locally administered, so no rule
+matches test traffic.
+
+\subsection{Testbed}
+Experiments run in Mininet~2.3.1b4 \cite{lantz2010mininet} on a laptop with an
+Intel Core i7-1355U (2 performance cores with 2 threads each, up to 5.0~GHz,
+and 8 efficiency cores, up to 3.7~GHz) and 15~GiB of RAM, running Linux
+7.2.15, with Clang~23.1.3 (\texttt{-O2}), libbpf~1.7.0, Open vSwitch~4.0.0,
+nftables~1.1.7, ipvsadm~1.31 and iperf3~3.22. These are the versions
+shipped in November 2026 by the rolling-release distribution used (Arch
+Linux/Omarchy); they are recorded automatically with every run from
+\texttt{uname -r}, \texttt{clang --version}, \texttt{ovs-vswitchd --version}
+and the other tools' version flags. The topology has one gateway, four clients and
+four backends, each host on its own veth link to the gateway. Transmit
+checksum offload is disabled on all veths, because a program at the XDP hook
+otherwise sees transport checksums that hold only a partial pseudo-header
+sum. This also disables TCP segmentation offload, so TCP is segmented into
+1500-byte packets in software in every configuration; absolute TCP
+throughput is therefore lower than on veth pairs with offloads enabled, but
+the comparison is like for like. Each backend runs an HTTP server whose page
+contains its own name, so every response identifies the serving backend. The
+eBPF control-plane daemon runs with $T_{\mathrm{idle}}=30$~s, $T_{\mathrm{fin}}=5$~s and a
+reaper period of 2~s.
+
+\subsection{Correctness Methodology}
+Functional correctness is evaluated at three levels: (i) 45 unit tests of the
+control-plane logic (rule encoding, pattern mask, active-backend list, fixed
+backend slots, state flushing, endpoint index, conntrack expiry, REST API)
+against in-memory maps; (ii) 85 kernel tests---42 cases $\times$ 2 hooks plus
+one equivalence test of both tail-call variants used in
+Section~\ref{sec:kernel-cost}---that load the real
+programs and execute crafted packets with \texttt{BPF\_PROG\_TEST\_RUN},
+checking verdicts, rewritten headers and the validity of every
+IPv4/TCP/UDP checksum, computed independently by the test. The kernel tests
+include one regression test per defect fixed during review: graceful
+draining, stale reverse entries, reply-side refresh, re-creation of evicted
+state in both directions, the client-visible rule key (one VIP rule covers
+both directions; client--backend rules do not affect VIP traffic), the
+isolation of backend service endpoints, uniform spreading after a drain,
+IPv4 fragments (including first fragments hitting isolation and port
+\textsc{drop} rules), read-only reply classification (a dropped reply creates
+no NAT state), stale state of a replaced backend, TCP SYNs that reuse a client
+port, and L2 rules on non-IP frames. (iii) Three Mininet
+scenarios run for every configuration: \textbf{T1} ping between all 56
+ordered host pairs; \textbf{T2} a bidirectional drop rule between $c_1$ and
+$s_3$, with $c_1 \to s_2$ required to stay reachable, the data plane's drop
+counter required to increase, and reachability restored after the rule is
+removed; \textbf{T3} 25 HTTP requests from each client to the VIP (100 new
+TCP connections), requiring zero failures and use of all backends,
+connection-tracking state, and---after draining $s_1$---no new connections on
+$s_1$ among 25 further connections. T3 also records the client port of
+every connection.
+
+\subsection{Performance Methodology}
+We measure two paths. The \emph{routed} path $c_1 \to$ gateway $\to s_2$
+exercises parsing, the firewall, connection tracking and telemetry, and
+exists in every configuration, including plain routing. The \emph{VIP} path
+$c_1 \to v' \to s_2$, with a second service $v'=10.100.0.2$:5202 (TCP and UDP)
+whose only backend is $s_2$, additionally exercises the load balancer:
+connection lookup, reverse-NAT maintenance, DNAT/SNAT and checksum rewriting.
+A single backend keeps \texttt{iperf3}'s control and data connections on the
+same server; the per-packet work is that of any load-balanced connection. On
+each path we measure TCP throughput (single-stream \texttt{iperf3}, 10~s) and
+the received packet rate for 64-byte frames (\texttt{iperf3} UDP with 22-byte
+payloads at unlimited rate, 10~s), $\mathrm{pps}=(N_{\mathrm{sent}}-
+N_{\mathrm{lost}})/T$. We also measure round-trip time from 500 ICMP echoes
+at 2~ms intervals on the routed path, and the new-connection rate through the
+main VIP from 200 sequential HTTP requests. Except in the ``+rules''
+configurations, the firewall tables hold no rules during these runs. For
+configurations with a firewall we also flood a
+blocked UDP port of $s_3$ from $c_1$ for 3~s and divide the increase of the
+drop counter by the sender's own measured duration.
+
+Every configuration was measured in 10 rounds; each round runs all 13
+configurations (eight, plus five ``+rules'' variants) once, each on a freshly
+built topology, so slow drift (e.g., thermal) affects all configurations
+alike. The CPU frequency governor is set
+to \texttt{performance} for the whole run, and the traffic tools are pinned to
+the first hardware threads of the two performance cores (client: CPU~0,
+server: CPU~2). The eBPF control-plane daemon and \texttt{ovs-vswitchd}, which
+handles first-packet upcalls, are pinned to the sibling threads of those
+cores (CPUs~1 and~3). The eight efficiency cores stay enabled and are used
+by the remaining processes (e.g., the HTTP servers and kernel threads). On veth
+links the gateway's receive processing runs in the sender's softirq context,
+on the sender's core, so for each direction the traffic tool and the data
+plane share one core, alike for all configurations. The eBPF daemon's reaper
+runs every 2~s; during the runs its three tables hold at most 608
+entries in total (recorded with every run), so a sweep takes about 3~ms
+at the measured sweep rate (Section~\ref{sec:kernel-cost}). We report means with 95\% confidence intervals (Student's $t$, 9
+degrees of freedom). Because the rounds are interleaved, run $r$ of two
+configurations forms a pair: we compare configurations with a \emph{paired}
+$t$-test on the per-round relative differences $100\,(a_r/b_r-1)$, whose mean
+and 95\% confidence interval we report, and give Welch's unpaired test where
+noted.
+
+Finally, an in-kernel microbenchmark times the loaded programs with
+\texttt{BPF\_PROG\_TEST\_RUN}, which reports the kernel's own measurement of
+the program's run time, independent of traffic generators; it runs pinned to
+CPU~0 under the same governor. Two timing modes are used. The \emph{repeat
+loop} runs one packet $2\times10^5$ times inside the kernel (15 samples); it
+is exact but keeps the packet's state hot in the cache and cannot be used for
+packets the program rewrites. \emph{Single-shot} runs execute each packet once
+per system call (20\,000 calls, 10 batch means); they include a constant
+timing overhead, which we quantify by measuring the pass path both ways. Each
+program is first warmed up with $10^6$ runs. We
+measure: (a) an admitted packet with 0 to 10\,000 non-matching rules spread
+over all ten patterns, so that every pattern is populated and probed (the
+worst case for the matcher); (b) an admitted packet with empty rule tables
+and 0 to 60\,000 entries in each connection table; (c) cache-cold state: 1000, 15\,000 and 60\,000 tracked
+flows visited in random order, versus one flow (15\,000 fits the
+16\,384-entry telemetry table, 60\,000 does not); (d) each processing
+path---pass, firewall drop, DNAT and SNAT of an established connection, and
+DNAT of a new TCP connection and of a new UDP flow---with one installed rule;
+(e) a tail-call ablation (XDP), in which the same code is split into three
+programs (firewall, load balancer/NAT, telemetry) chained by
+\texttt{bpf\_tail\_call}, in two variants: each stage re-parses the packet,
+as in chained frameworks \cite{miano2021polycube}, or the stages share the
+parse result through a per-CPU map and the last stage only re-derives header
+pointers from stored offsets; (f) the
+backend distribution of 20\,000 new connections with all four backends
+active and with one drained; and (g) the time of one reaper sweep over
+$3\times60\,000$ connection entries.
+
+%=====================================================================
+\section{Results and Performance Analysis}
+\label{sec:results}
+%=====================================================================
+Relative differences in this section are computed from unrounded sample
+means and may differ by $0.1$ percentage points from values recomputed from
+the rounded table entries. Unless noted otherwise, $p$-values are from the
+paired $t$-test of Section~\ref{sec:setup} and are not corrected for
+multiple comparisons; since we report more than 60 comparisons, values
+between $0.01$ and $0.05$ should be read as suggestive only. Relative to
+Welch's unpaired test, pairing moved a few borderline comparisons across
+$p=0.05$ in both directions (e.g., TC vs.\ nft+IPVS in VIP TCP throughput,
+$p=0.063$ unpaired and $0.024$ paired; XDP vs.\ OVS-ct, $0.024$ and $0.058$)
+but changed none of the conclusions below, and its intervals were not
+consistently narrower: most of the variation is between rounds of the same
+configuration, not drift shared by all configurations of a round.
+Appendix~\ref{app:figs} plots every measurement of this section with its
+95\% confidence interval (Figs.~\ref{fig:app-tcp}--\ref{fig:app-newconn}).
+
+\subsection{Functional Correctness}
+All 45 unit tests pass. Of the 85 kernel tests, 84 pass and one is skipped:
+for TC, the kernel's test harness refuses to construct a socket buffer from a
+frame too short to hold an IPv4 header, so the truncated-frame case is
+exercised only at the XDP hook (the TC program is still tested with an
+invalid header length). In total, 129 of the 130 automated unit and kernel
+tests pass and one is skipped; the Mininet checks of Table~\ref{tab:correct}
+are counted separately.
+
+Table~\ref{tab:correct} summarizes the Mininet scenarios. All three eBPF
+configurations, including TC+FIB, and the three stateful baselines pass every
+check. Stateless OVS passes every check it can express; it has no connection
+tracking. In T2, every data plane's drop counter rose by exactly the three
+blocked echo requests.
+
+\begin{table}[t]
+\caption{Functional results of the Mininet scenarios (n/a: function not
+available in that configuration)}
+\label{tab:correct}
+\centering\scriptsize
+\setlength{\tabcolsep}{1.6pt}
+\begin{tabular}{@{}lccccccc@{}}
+\toprule
+Check & XDP & TC & \shortstack{TC+\\FIB} & \shortstack{nft+\\IPVS} & \shortstack{nft-\\FT} & OVS & \shortstack{OVS-\\ct} \\
+\midrule
+T1 all-pairs reachability (56 pairs) & pass & pass & pass & pass & pass & pass & pass \\
+T2 $c_1 \leftrightarrow s_3$ blocked & pass & pass & pass & pass & pass & pass & pass \\
+T2 $c_1 \to s_2$ still reachable & pass & pass & pass & pass & pass & pass & pass \\
+T2 drops counted by the data plane & pass & pass & pass & pass & pass & pass & pass \\
+T2 reachability restored & pass & pass & pass & pass & pass & pass & pass \\
+T3 100/100 requests answered & pass & pass & pass & pass & pass & pass & pass \\
+T3 all four backends used & pass & pass & pass & pass & pass & pass & pass \\
+T3 connection tracking populated & pass & pass & pass & pass & pass & n/a & pass \\
+T3 drained backend: no new conn. & pass & pass & pass & pass & pass & pass & pass \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Load Distribution}
+Table~\ref{tab:dist} lists the exact backend counts of T3. With $n=4$ and
+$N=100$, Eq.~(\ref{eq:chi2}) gives $\chi^2$ between $1.52$ and $4.64$
+($p \ge 0.20$) for every configuration except TC, so uniformity is not
+rejected at the 5\% level. TC's counts (35, 11, 27, 27) give $\chi^2=12.16$
+($p=0.007$), which rejects uniformity at the 5\% level but not after a
+Bonferroni correction for the 14 tests of the table ($0.05/14=0.0036$).
+After $s_1$ was drained, all 25 further connections were served by
+$s_2$--$s_4$ in every configuration, without rejecting uniformity over the
+three remaining backends ($\chi^2 \le 2.00$, $p \ge 0.37$, 2 degrees of
+freedom).
+
+TC's imbalance is a property of its sample, not of its code. The selection
+hash (Eq.~(\ref{eq:select})) is unseeded, so a connection's backend is a
+function of its 4-tuple alone, and T3 records the client port of every
+connection. Replaying the recorded tuples through an offline model of the
+hash and of Eq.~(\ref{eq:select}) reproduces all 125 recorded choices of
+each eBPF configuration (100 before and 25 after the drain). The client ports
+differ between runs (e.g., 41\,334--41\,530 for XDP and 48\,712--48\,992 for TC
+on $c_1$; the kernel prefers even ports for outgoing connections and starts
+from an offset that differs between runs), so each configuration draws a
+different sample of 100 tuples. Identical port sequences in two runs would
+produce identical choices; this is the most likely cause of the identical TC
+and TC+FIB counts in our previous revision, which we cannot confirm because
+ports were not yet recorded then.
+
+With $N=100$ this test has little statistical power. The in-kernel test (f)
+therefore offers 20\,000 new connections from distinct client addresses and
+ports. With all backends active the counts are 5026, 4983, 4951 and 5040
+($\chi^2=0.99$, $p=0.80$); with $s_1$ drained they are 6646, 6666 and 6688
+($\chi^2=0.13$, $p=0.94$). The active-backend list of
+Eq.~(\ref{eq:select}) thus spreads the drained backend's share evenly, unlike
+linear probing, which would hand it entirely to the next backend in the pool.
+An unseeded hash is predictable, however: a client that can choose its source
+ports can choose its backend. A per-boot random seed would remove this at no
+cost; we leave the hash unseeded here so that runs are reproducible.
+
+\begin{table}[t]
+\caption{Backend counts of new VIP connections in T3: 100 connections, then
+25 after draining $s_1$ ($\chi^2$ and $p$ by Eq.~(\ref{eq:chi2}); 3 and 2
+degrees of freedom)}
+\label{tab:dist}
+\centering\scriptsize
+\setlength{\tabcolsep}{2.0pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lrrrrrrrrrrr@{}}
+\toprule
+ & \multicolumn{6}{c}{All backends active} & \multicolumn{5}{c}{$s_1$ drained} \\
+\cmidrule(lr){2-7}\cmidrule(l){8-12}
+Config & $s_1$ & $s_2$ & $s_3$ & $s_4$ & $\chi^2$ & $p$ & $s_2$ & $s_3$ & $s_4$ & $\chi^2$ & $p$ \\
+\midrule
+XDP      & 19 & 24 & 28 & 29 & 2.48  & 0.48  & 8  & 9  & 8  & 0.08 & 0.96 \\
+TC       & 35 & 11 & 27 & 27 & 12.16 & 0.007 & 5  & 10 & 10 & 2.00 & 0.37 \\
+TC+FIB   & 28 & 25 & 20 & 27 & 1.52  & 0.68  & 6  & 8  & 11 & 1.52 & 0.47 \\
+nft+IPVS & 31 & 23 & 19 & 27 & 3.20  & 0.36  & 7  & 9  & 9  & 0.32 & 0.85 \\
+nft-FT   & 26 & 21 & 32 & 21 & 3.28  & 0.35  & 6  & 8  & 11 & 1.52 & 0.47 \\
+OVS      & 22 & 29 & 30 & 19 & 3.44  & 0.33  & 8  & 7  & 10 & 0.56 & 0.76 \\
+OVS-ct   & 26 & 30 & 16 & 28 & 4.64  & 0.20  & 11 & 7  & 7  & 1.28 & 0.53 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{table*}[t]
+\caption{Benchmark results: mean $\pm$ 95\% CI over 10 interleaved rounds.
+Routed path $c_1 \to$ gateway $\to s_2$; VIP path $c_1 \to v' \to s_2$ through
+the load balancer. ``+rules'': 1000 non-matching rules populating all ten
+patterns (n/a: no load balancer or firewall)}
+\label{tab:perf}
+\centering\footnotesize
+\setlength{\tabcolsep}{4pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lrrrrrrrr@{}}
+\toprule
+ & \multicolumn{2}{c}{Routed path} & \multicolumn{2}{c}{VIP path} &
+   \multicolumn{2}{c}{RTT, routed ($\mu$s)} & VIP conn. & Flood drops$^{*}$ \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+Config & TCP (Gbit/s) & 64-B (kpps) & TCP (Gbit/s) & 64-B (kpps) & avg & max & (1/s) & (kpps) \\
+\midrule
+XDP & 9.94$\pm$0.12 & 510$\pm$23 & 8.92$\pm$0.57 & 487$\pm$19 & 4.1$\pm$1.4 & 35$\pm$10 & 1349$\pm$180 & 896$\pm$33 \\
+TC & 10.62$\pm$0.39 & 560$\pm$45 & 9.36$\pm$0.60 & 541$\pm$30 & 4.3$\pm$1.9 & 35$\pm$8 & 1308$\pm$169 & 917$\pm$68 \\
+TC+FIB & 10.63$\pm$0.55 & 602$\pm$24 & 9.66$\pm$0.71 & 552$\pm$46 & 2.9$\pm$0.9 & 32$\pm$9 & 1269$\pm$172 & 898$\pm$117 \\
+Kernel & 11.87$\pm$1.78 & 621$\pm$82 & n/a & n/a & 3.5$\pm$2.4 & 33$\pm$12 & n/a & n/a \\
+nft+IPVS & 9.06$\pm$0.67 & 544$\pm$26 & 8.76$\pm$0.31 & 524$\pm$12 & 3.3$\pm$1.2 & 39$\pm$8 & 1476$\pm$131 & 704$\pm$27 \\
+nft-FT & 13.27$\pm$0.38 & 675$\pm$29 & 12.10$\pm$1.23 & 628$\pm$57 & 5.4$\pm$2.6 & 46$\pm$15 & 1159$\pm$252 & 606$\pm$37 \\
+OVS & 11.90$\pm$1.38 & 616$\pm$49 & 9.81$\pm$0.85 & 573$\pm$32 & 5.1$\pm$2.5 & 213$\pm$60 & 1393$\pm$80 & 869$\pm$29 \\
+OVS-ct & 10.30$\pm$0.20 & 582$\pm$8 & 9.67$\pm$0.36 & 521$\pm$26 & 4.6$\pm$1.6 & 197$\pm$30 & 1359$\pm$206 & 878$\pm$43 \\
+\midrule
+TC +rules & 8.85$\pm$0.51 & 530$\pm$18 & 8.22$\pm$0.73 & 503$\pm$30 & 3.0$\pm$0.8 & 39$\pm$15 & 1551$\pm$109 & 886$\pm$28 \\
+TC+FIB +rules & 9.42$\pm$0.13 & 523$\pm$37 & 8.34$\pm$0.72 & 498$\pm$27 & 2.9$\pm$0.9 & 40$\pm$10 & 1234$\pm$275 & 869$\pm$154 \\
+nft+IPVS +rules & 6.20$\pm$0.69 & 377$\pm$32 & 8.15$\pm$0.87 & 501$\pm$35 & 6.2$\pm$2.2 & 49$\pm$10 & 1352$\pm$233 & 685$\pm$30 \\
+nft-FT +rules & 13.20$\pm$0.87 & 669$\pm$37 & 11.99$\pm$1.44 & 631$\pm$86 & 6.3$\pm$2.1 & 56$\pm$13 & 1316$\pm$200 & 600$\pm$36 \\
+OVS-ct +rules & 10.04$\pm$0.79 & 573$\pm$38 & 9.59$\pm$0.48 & 537$\pm$17 & 3.6$\pm$0.5 & 270$\pm$78 & 1455$\pm$138 & 855$\pm$43 \\
+\bottomrule
+\multicolumn{9}{@{}l}{\scriptsize $^{*}$Sender-limited: every flood packet was dropped; the in-kernel drop cost is in Table~\ref{tab:paths}.
+Without ``+rules'', rule tables are empty except during the flood test, which installs one drop rule.}
+\end{tabular}}
+\end{table*}
+
+\begin{figure}[t]
+\centering
+\pgfplotsset{benchbar8/.style={benchbar,
+  symbolic x coords={XDP,TC,TC+FIB,Kernel,nft+IPVS,nft-FT,OVS,OVS-ct}}}
+\begin{tikzpicture}
+\begin{axis}[benchbar8, bar width=4pt, ylabel={TCP (Gbit/s)}, ymax=16,
+  nodes near coords={},
+  legend style={font=\scriptsize, at={(0.5,1.02)}, anchor=south, legend columns=2, draw=none}]
+\addplot[fill=blue!55, error bars/.cd, y dir=both, y explicit] coordinates {
+  (XDP,9.94) +- (0,0.12) (TC,10.62) +- (0,0.39) (TC+FIB,10.63) +- (0,0.55)
+  (Kernel,11.87) +- (0,1.78) (nft+IPVS,9.06) +- (0,0.67) (nft-FT,13.27) +- (0,0.38)
+  (OVS,11.90) +- (0,1.38) (OVS-ct,10.30) +- (0,0.20)};
+\addplot[fill=orange!60, error bars/.cd, y dir=both, y explicit] coordinates {
+  (XDP,8.92) +- (0,0.57) (TC,9.36) +- (0,0.60) (TC+FIB,9.66) +- (0,0.71)
+  (Kernel,0) (nft+IPVS,8.76) +- (0,0.31) (nft-FT,12.10) +- (0,1.23)
+  (OVS,9.81) +- (0,0.85) (OVS-ct,9.67) +- (0,0.36)};
+\legend{routed path, VIP path}
+\end{axis}
+\end{tikzpicture}\\[1mm]
+\begin{tikzpicture}
+\begin{axis}[benchbar8, bar width=4pt, ylabel={64-B rate (kpps)}, ymax=800,
+  nodes near coords={}]
+\addplot[fill=blue!55, error bars/.cd, y dir=both, y explicit] coordinates {
+  (XDP,510) +- (0,23) (TC,560) +- (0,45) (TC+FIB,602) +- (0,24)
+  (Kernel,621) +- (0,82) (nft+IPVS,544) +- (0,26) (nft-FT,675) +- (0,29)
+  (OVS,616) +- (0,49) (OVS-ct,582) +- (0,8)};
+\addplot[fill=orange!60, error bars/.cd, y dir=both, y explicit] coordinates {
+  (XDP,487) +- (0,19) (TC,541) +- (0,30) (TC+FIB,552) +- (0,46)
+  (Kernel,0) (nft+IPVS,524) +- (0,12) (nft-FT,628) +- (0,57)
+  (OVS,573) +- (0,32) (OVS-ct,521) +- (0,26)};
+\end{axis}
+\end{tikzpicture}
+\caption{TCP throughput (top) and received 64-byte packet rate (bottom) on
+the routed path and through the VIP with empty rule tables (kernel routing
+has no VIP); error bars are 95\% confidence intervals over 10 rounds. The
+populated-rule results are in Table~\ref{tab:perf} and
+Figs.~\ref{fig:app-rulestcp}--\ref{fig:app-rulespps}.}
+\label{fig:tput}
+\end{figure}
+
+\subsection{Throughput and Packet Rate}
+\label{sec:tput}
+Table~\ref{tab:perf} lists all measurements and Fig.~\ref{fig:tput} plots
+throughput and packet rate with empty rule tables. Differences below are
+paired by round (mean $\pm$ 95\% CI of the per-round relative difference).
+Two rounds contain clear outliers that affect only single configurations:
+kernel routing reached 5.5~Gbit/s in round~8 (10.4--13.6~Gbit/s otherwise),
+and stateless OVS 7.2~Gbit/s in round~7. We keep them in all tables and tests
+and note where a conclusion depends on them.
+\begin{itemize}
+\item \textbf{Stateless forwarding.} Kernel routing reaches 11.87~Gbit/s
+(13.05~Gbit/s median) and 621~kpps; stateless OVS is statistically
+indistinguishable from it ($p \ge 0.58$).
+\item \textbf{Cost of state relative to routing.} Because of the kernel's
+outlier round, paired comparisons with kernel routing have little power: only
+nft+IPVS is significantly slower in TCP ($-20.3 \pm 13.5\%$, $p=0.008$).
+Excluding round~8 as a sensitivity check, the eBPF configurations cost
+13.6--20.4\% of TCP throughput, OVS-ct 17.5\% and nft+IPVS 25.8\% (all
+$p \le 0.008$), consistent with the 13.6--26.9\% of our previous revision.
+nft-FT, whose established flows bypass routing, is not slower than plain
+routing ($+6.1 \pm 7.6\%$, $p=0.10$).
+\item \textbf{eBPF versus nft+IPVS.} On the routed path, TC and TC+FIB
+deliver $18.1 \pm 7.8\%$ and $18.2 \pm 8.8\%$ more TCP throughput
+($p \le 0.001$), and TC+FIB $11.0 \pm 5.6\%$ more packets ($p=0.002$); TC's
+packet rate is indistinguishable ($p=0.34$). Through the VIP, TC and TC+FIB
+deliver $6.9 \pm 5.7\%$ and $10.7 \pm 9.9\%$ more TCP throughput ($p=0.024$
+and $0.037$) and statistically indistinguishable packet rates. XDP is
+$11.0\%$ faster in routed TCP ($p=0.028$) but $7.0 \pm 3.5\%$ slower in VIP
+packet rate ($p=0.001$).
+\item \textbf{eBPF versus the flowtable fast path.} nft-FT is the fastest
+stateful configuration on every metric. TC+FIB, its eBPF counterpart, is
+$19.7 \pm 5.2\%$ below it in routed TCP throughput, $10.7 \pm 5.0\%$ in
+routed packet rate, and $18.3 \pm 11.6\%$ and $10.8 \pm 10.6\%$ through the
+VIP (all $p \le 0.046$); TC is 12.6--21.0\% below it ($p \le 0.012$) and
+XDP 21.1--25.0\% ($p<0.001$). The
+flowtable resolves an established flow, including its NAT binding and output
+interface, with one lookup at the ingress hook and then skips routing,
+connection tracking and the forward chain, whereas the eBPF pipeline still
+evaluates the firewall, connection, NAT and telemetry tables for every
+packet. The advantage of TC+FIB over nft+IPVS therefore comes mostly from
+bypassing the forwarding path, which the kernel can also do: the flowtable
+raises nftables' own throughput by $48.2 \pm 13.8\%$ over nft+IPVS.
+\item \textbf{eBPF versus OVS-ct.} TC and TC+FIB are statistically
+indistinguishable from OVS-ct on both paths (all $|\Delta| \le 6.3\%$,
+$p \ge 0.06$). XDP is below OVS-ct by $3.5 \pm 1.1\%$ in routed TCP and
+$12.4 \pm 4.2\%$ in routed packet rate ($p<0.001$); through the VIP its
+deficit (6--7\%) is not significant ($p \ge 0.058$).
+\item \textbf{Hooks and forwarding.} XDP is never faster than TC: on the
+routed path it delivers $6.2 \pm 3.2\%$ less TCP throughput ($p=0.002$), and
+through the VIP $9.5 \pm 6.5\%$ fewer packets ($p=0.009$). On both paths,
+in-program FIB forwarding does not significantly change throughput or packet
+rate relative to TC alone (all $|\Delta| \le 8.8\%$, $p \ge 0.12$).
+\item \textbf{Cost of load balancing.} Through the VIP, the eBPF
+configurations deliver 9.1--11.9\% less TCP throughput than on their routed
+path ($p \le 0.003$ for XDP and TC, $p=0.11$ for TC+FIB, paired) and
+3.4--8.3\% fewer packets (significant only for TC+FIB, $p=0.044$). OVS-ct
+loses $6.1\%$ and $10.6\%$ ($p \le 0.002$), nft+IPVS and nft-FT lose
+3.3--8.8\% (not significant, $p \ge 0.10$), and stateless OVS loses 17.5\% of
+TCP throughput through its \texttt{select} group ($p=0.047$).
+\end{itemize}
+
+\textit{Populated rule tables.} With 1000 rules spread over all ten patterns
+(Table~\ref{tab:perf}, ``+rules''; Figs.~\ref{fig:app-rulestcp} and
+\ref{fig:app-rulespps}), the eBPF data plane loses throughput, because every
+packet now probes ten hash tables (Section~\ref{sec:kernel-cost}): TC loses
+$16.4 \pm 6.1\%$ of routed TCP throughput ($p<0.001$) and TC+FIB
+$11.0 \pm 4.9\%$ of routed TCP and $12.8 \pm 7.4\%$ of routed packet rate
+($p \le 0.004$); through the VIP the losses are 6--13\% (significant for
+TC+FIB TCP, $p=0.006$). nft+IPVS loses $31.7 \pm 6.1\%$ of routed TCP
+throughput and $30.7 \pm 4.5\%$ of its packet rate ($p<0.001$), because its
+ten set lookups run for every forwarded packet; its VIP path is not affected
+significantly ($p \ge 0.11$), because IPVS forwards VIP traffic from the
+input hook and the rule sets in the forward chain do not see it. nft-FT and
+OVS-ct show no measurable change (all $|\Delta| \le 3.5\%$, $p \ge 0.13$):
+both evaluate the rules only for the first packets of a flow and then serve
+it from the flowtable or the megaflow cache. With rules installed, the eBPF
+data plane therefore falls behind OVS-ct: TC by $11.4 \pm 4.2\%$ in routed
+TCP and $14.0 \pm 7.7\%$ in VIP TCP ($p \le 0.003$), TC+FIB by 7.0--12.4\%
+in packet rate and VIP TCP ($p \le 0.042$, routed TCP not significant), while
+it stays 42--57\% ahead of nft+IPVS on the routed path ($p \le 0.007$) and
+28--32\% behind nft-FT in TCP throughput ($p<0.001$). The ``empty tables''
+results above are thus the best case for the eBPF design, and a per-flow
+verdict cache---the analogue of the megaflow cache and the flowtable---is
+needed to keep its cost independent of the policy.
+
+\subsection{Latency and Connection Rate}
+\label{sec:latency}
+Average round-trip times are 2.9--6.3~$\mu$s, close to the 1~$\mu$s
+resolution of \texttt{ping}, and no paired difference between the eBPF
+configurations and their baselines is significant ($p \ge 0.18$). TC+FIB has
+the lowest average among the stateful configurations (2.9~$\mu$s); the 34\%
+reduction relative to TC that we reported in our previous revision is not
+reproduced ($-11.5 \pm 35.4\%$, $p=0.48$). OVS-ct and stateless OVS have by
+far the highest maximum RTT (197 and 213~$\mu$s; 270~$\mu$s for OVS-ct with
+rules), versus 32--56~$\mu$s for all other configurations: the first packet
+of a flow misses the OVS kernel cache and is handled by
+\texttt{ovs-vswitchd} in user space. The new-connection rate through the VIP
+is 1159--1551 connections/s for all load-balancing configurations, with no
+significant difference between the eBPF configurations and the stateful
+baselines (e.g., XDP vs.\ nft+IPVS, $p=0.28$; TC vs.\ OVS-ct, $p=0.92$); at
+this level it is bounded by the user-space HTTP client and server, not by the
+gateway.
+
+\subsection{In-Kernel Cost and Scalability}
+\label{sec:kernel-cost}
+\textit{Rules and connections.} Fig.~\ref{fig:scale} shows the cost of an
+admitted packet in the repeat loop. With empty rule tables, the pipeline costs
+68~ns at XDP and 78~ns at TC. When rules cover all ten patterns, every packet
+probes ten hash tables and the cost rises to 224--270~ns (XDP) and
+236--247~ns (TC), i.e., about 16--20~ns per populated pattern. The cost then
+does not grow with the number of rules: from 10 to 10\,000 rules,
+intermediate points vary non-monotonically within this range (e.g., 270~ns
+for 1000 rules and 231~ns for 10\,000 at XDP). The number of tracked
+connections has no measurable effect at XDP (69--73~ns from 0 to 60\,000
+entries per table). At TC, the 10\,000- and 60\,000-entry points (78 and
+79~ns) equal the empty-table cost of the rule sweep, while the 0- and
+1000-entry points are higher (106 and 95~ns). The 0-entry point is the same
+configuration as the rule sweep's first point, measured minutes later, and
+cost cannot fall as tables grow, so we attribute these two points to
+transient interference rather than to table size; differences of up to
+about 30~ns between repeated measurements of the same configuration are
+therefore the reproducibility limit of this microbenchmark. (Our previous
+revision showed the reverse pattern, a high first point of the rule sweep;
+the longer warm-up did not remove such outliers.) Within this limit, the
+results confirm the $O(1)$ claim of Section~\ref{sec:complexity}, with a
+constant that depends on the number of populated patterns, not on the number
+of rules or connections.
+
+\textit{Cache-cold state.} The repeat loop keeps one flow's state in the
+cache. When tracked flows are visited in random order (single-shot, empty
+rule tables), the cost rises from 132~ns (XDP) and 120~ns (TC) for one flow to
+234--238~ns for 1000 flows, 290~ns (TC) and 524~ns (XDP) for 15\,000 flows,
+and 435--455~ns for 60\,000 flows (Fig.~\ref{fig:app-cold}). With 15\,000
+flows all telemetry entries fit their table (16\,384 entries), so this rise
+contains no LRU eviction: it is the cost of cache misses in the connection,
+reverse and telemetry tables. At 60\,000 flows most packets must also
+re-insert their telemetry entry; this adds 145~ns at TC, whereas the XDP
+15\,000-flow point varies so much (CI $\pm61$~ns) that the two XDP points are
+not distinguishable. The hot per-packet figures are therefore a lower bound;
+with many concurrent flows, memory latency dominates the cost.
+
+\textit{Processing paths.} Table~\ref{tab:paths} lists the cost of each path
+with one installed rule. Dropping costs 60--67~ns in the repeat loop,
+i.e., about 15~Mpps per core of in-kernel drop capacity, far above the
+0.6--1.0~Mpps that the Python flood generator produced. Single-shot runs
+include a timing overhead, estimated as single-shot minus repeat-loop pass
+cost: 38~ns at XDP and 86~ns at TC in this run (60--80~ns in our previous
+one). It cancels in differences: DNAT of an established connection adds
+64--65~ns over the pass path at both hooks, and SNAT 16~ns at TC. At XDP, SNAT
+measured 275~ns in this run, against 169~ns in our previous run with the
+same code path; we cannot attribute this to a code change and treat
+single-shot differences below about 100~ns between runs as not reproducible.
+The first packet of a new TCP connection costs 1.5--1.7~$\mu$s, about seven
+times an established one, because it inserts entries into the load
+balancer's forward and reverse tables, the firewall's connection table and
+the telemetry table. A new UDP flow, which also probes the $n=4$ reverse
+entries of the pool (Section~\ref{sec:complexity}), costs 2.0--2.2~$\mu$s;
+the 0.4--0.6~$\mu$s difference is about as large as the confidence
+intervals (Fig.~\ref{fig:app-newconn}).
+
+\textit{Tail-call ablation.} Table~\ref{tab:paths} also gives the two chained
+variants (XDP). In the repeat loop, chaining costs nothing measurable on the
+pass path (115 and 112~ns versus 115~ns for the single program), and the
+drop path, which ends in the first stage, differs by $-8$ to $+12$~ns. In
+single-shot runs, where the three programs' code and the scratch state are
+less likely to be cached, the re-parsing chain costs 46~ns more on the pass
+path and 67~ns more for DNAT; relative to the single program this is $+30\%$
+and $+31\%$ of the raw single-shot cost, or $+40\%$ and $+38\%$ after
+subtracting the 38~ns timing overhead from the denominator. On the SNAT path
+the chain is 18~ns ($7\%$) \emph{faster}, which is within the
+irreproducibility of the XDP SNAT figure noted above. Sharing the parse
+result through a per-CPU map does not help: the shared-metadata chain is
+slower than the re-parsing chain in single-shot runs (pass 258 versus
+199~ns, DNAT 309 versus 285~ns) and equal on SNAT. Re-parsing a packet whose
+headers are already in the L1 cache is cheaper than writing and reading the
+roughly 100-byte stage context in a map value. These results replace the
+33--47\% penalty of our previous revision, which mixed repeat-loop and
+single-shot denominators and was not reproduced in the repeat loop here: for
+this pipeline, the single-program design saves 46--67~ns (about 30--40\%) of
+the single-shot cost on the pass and DNAT paths and little when state is
+hot. We have not measured whether this holds for Polycube's chains or after
+KFuse-style merging, which differ in parsing and state layout.
+
+\textit{Control-plane cost.} One reaper sweep over $3\times60\,000$ entries
+takes 0.84~s ($2.1\times10^5$ entries/s), because entries are read one system
+call at a time. With full tables ($3\times65\,536=196\,608$ entries,
+Table~\ref{tab:maps}) a sweep would take about 0.92~s of the 2~s reaper
+period on one core; batched map operations would reduce this. During the
+macro-benchmarks the tables held at most 608 entries, so each sweep took
+about 3~ms.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=0.56\columnwidth, height=3.7cm, ymin=0, ymax=350,
+  symbolic x coords={0,10,100,1k,10k}, xtick=data, ylabel={ns per packet},
+  xlabel={installed rules}, axis lines*=left, ymajorgrids, grid style={gray!25},
+  tick label style={font=\scriptsize}, label style={font=\scriptsize},
+  legend style={font=\scriptsize, at={(0.98,0.03)}, anchor=south east, draw=none}]
+\addplot[blue!70, mark=*, mark size=1.4pt, error bars/.cd, y dir=both, y explicit]
+  coordinates {(0,68.3) +- (0,0.9) (10,232.1) +- (0,12.9) (100,223.8) +- (0,4.5)
+               (1k,269.9) +- (0,22.4) (10k,231.1) +- (0,2.1)};
+\addplot[teal!80!black, mark=square*, mark size=1.4pt, error bars/.cd, y dir=both, y explicit]
+  coordinates {(0,77.7) +- (0,0.6) (10,244.4) +- (0,13.0) (100,237.2) +- (0,1.6)
+               (1k,236.4) +- (0,2.1) (10k,246.6) +- (0,6.6)};
+\legend{XDP, TC}
+\end{axis}
+\end{tikzpicture}%
+\begin{tikzpicture}
+\begin{axis}[width=0.56\columnwidth, height=3.7cm, ymin=0, ymax=350,
+  symbolic x coords={0,1k,10k,60k}, xtick=data, yticklabels={},
+  xlabel={tracked connections}, axis lines*=left, ymajorgrids, grid style={gray!25},
+  tick label style={font=\scriptsize}, label style={font=\scriptsize}]
+\addplot[blue!70, mark=*, mark size=1.4pt, error bars/.cd, y dir=both, y explicit]
+  coordinates {(0,68.9) +- (0,0.8) (1k,69.6) +- (0,1.1) (10k,73.0) +- (0,4.9)
+               (60k,72.0) +- (0,0.5)};
+\addplot[teal!80!black, mark=square*, mark size=1.4pt, error bars/.cd, y dir=both, y explicit]
+  coordinates {(0,105.7) +- (0,6.1) (1k,94.9) +- (0,5.1) (10k,78.3) +- (0,0.9)
+               (60k,78.9) +- (0,0.7)};
+\end{axis}
+\end{tikzpicture}
+\caption{In-kernel cost of an admitted packet versus installed rules, spread
+over all ten patterns (left; 0 rules: no populated pattern), and versus
+tracked connections per table with empty rule tables (right); mean $\pm$ 95\%
+CI of 15 repeat-loop samples of $2\times10^5$ runs each (performance core,
+fixed governor). The TC points at 0 and 1k connections are discussed in
+Section~\ref{sec:kernel-cost}.}
+\label{fig:scale}
+\end{figure}
+
+\begin{table}[t]
+\caption{In-kernel cost per processing path with one installed rule (ns,
+mean $\pm$ 95\% CI)}
+\label{tab:paths}
+\centering\scriptsize
+\setlength{\tabcolsep}{1.6pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+ & \multicolumn{2}{c}{Repeat loop} & \multicolumn{5}{c}{Single-shot (incl.\ timing overhead)} \\
+\cmidrule(lr){2-3}\cmidrule(l){4-8}
+Variant & Pass & Drop & Pass & \shortstack{DNAT\\est.} & \shortstack{DNAT\\new TCP} & \shortstack{DNAT\\new UDP} & \shortstack{SNAT\\est.} \\
+\midrule
+XDP & 115.1$\pm$12.7 & 59.6$\pm$1.3 & 153.0$\pm$1.8 & 217.4$\pm$4.3 & 1548$\pm$254 & 2154$\pm$438 & 275.5$\pm$13.3 \\
+TC  & 95.1$\pm$0.6 & 66.7$\pm$1.9 & 180.6$\pm$17.8 & 245.6$\pm$10.4 & 1654$\pm$303 & 2022$\pm$253 & 196.8$\pm$4.7 \\
+Chain$^{a}$ & 115.1$\pm$1.7 & 51.2$\pm$2.0 & 198.5$\pm$3.4 & 284.5$\pm$3.3 & -- & -- & 257.4$\pm$5.8 \\
+Chain$^{b}$ & 112.4$\pm$1.4 & 71.6$\pm$4.2 & 257.6$\pm$7.4 & 309.4$\pm$9.7 & -- & -- & 256.3$\pm$2.9 \\
+\bottomrule
+\multicolumn{8}{@{}l}{\scriptsize XDP, three programs linked by \texttt{bpf\_tail\_call} (ablation (e)): $^{a}$every stage}\\
+\multicolumn{8}{@{}l}{\scriptsize re-parses; $^{b}$stages share the parse result via a per-CPU map. --: not measured.}
+\end{tabular}}
+\end{table}
+
+\textit{Flood test.} Every flood packet was dropped in every configuration,
+so the flood rates in Table~\ref{tab:perf} are bounded by the single-threaded
+sender. On veth links, however, the gateway's processing runs in the
+sender's softirq context on the same core, so the rate still reflects the
+cost of the drop path. The eBPF data planes and both OVS configurations
+sustain 869--917~kpps, statistically indistinguishable from each other
+(e.g., TC vs.\ OVS-ct $+4.6\%$, $p=0.21$). nft+IPVS, which drops in the
+forward hook after the routing decision and the conntrack lookup, sustains
+19--23\% fewer (equivalently, the others sustain 24--31\% more;
+$p \le 0.007$), and nft-FT another $13.7 \pm 5.8\%$ fewer
+than nft+IPVS ($p<0.001$): a dropped packet never becomes an established
+connection, so it gains nothing from the flowtable, and every one of them
+also traverses nft-FT's DNAT chain as a new connection. Installed rules do
+not change these rates significantly.
+
+\subsection{Discussion}
+\textit{Functionality.} With connection tracking, all four stateful designs
+provide the required functions: stateful filtering, VIP load balancing with
+NAT, graceful draining and in-kernel drop counters. The eBPF design differs in
+\emph{how}: one verified program and one set of maps implement the whole
+policy, its behaviour is specified by
+Eqs.~(\ref{eq:patterns})--(\ref{eq:expiry}), it exports per-flow counters of
+admitted traffic, it judges load-balanced traffic by the client-visible flow,
+and it isolates backend service endpoints from direct access. Stateless
+OpenFlow~1.3 lacks connection tracking and drains only by re-hashing existing
+connections; OVS's conntrack extensions remove this gap. The flowtable and
+the megaflow cache evaluate the policy when a flow is set up, so a rule added
+later reaches established flows only when the cached state is removed (we
+flush the matching conntrack entries in nft-FT; OVS revalidates its cache),
+whereas the eBPF pipeline applies every rule change to the next packet.
+
+\textit{Performance.} On veth links with empty rule tables, the eBPF data
+plane at the TC hook performs on par with OVS-ct and better than nft+IPVS in
+TCP throughput, but every eBPF configuration is 11--25\% slower than the
+kernel's own flowtable fast path, and with all ten rule patterns populated the
+eBPF data plane falls 6--14\% behind OVS-ct on most metrics. Three effects shape these
+numbers. First, the decisive factor is how much work an established packet
+needs, not where the program runs: the flowtable and the megaflow cache
+reduce it to one lookup, while our pipeline re-evaluates the firewall, NAT
+and telemetry state for every packet; its cost grows with the number of
+populated rule patterns (16--20~ns each, Section~\ref{sec:kernel-cost}). A
+per-flow verdict cache that stores the admission decision and the NAT
+rewrite of an established flow, invalidated by a generation counter on every
+rule change, is the corresponding optimization and would preserve the
+immediate effect of rule changes. Second, XDP's advantage comes from running
+in the NIC driver before a socket buffer is allocated; a veth packet already
+has one, so native veth XDP must convert it and gains nothing from early
+execution---here it is the slowest eBPF variant. Third, with many concurrent
+flows memory latency, not instruction count, dominates the cost
+(Section~\ref{sec:kernel-cost}).
+
+\subsection{Threats to Validity}
+\label{sec:threats}
+All links are veth pairs inside one machine, which does not exercise XDP's
+driver-level fast path, and the traffic generators share the CPU with the
+gateway; pinning and interleaving reduce but do not remove this
+interference, as the outlier rounds of kernel routing and stateless OVS show.
+Ten rounds bound the uncertainty of each mean (Table~\ref{tab:perf}); smaller
+differences, such as among the three eBPF configurations, remain within it.
+We report more than 60 comparisons without correcting for multiple
+comparisons, so $p$-values between $0.01$ and $0.05$ are only suggestive.
+The ``+rules'' configurations install 1000 non-matching rules; rule sets that
+match traffic, and other rule layouts for nftables and OVS, may behave
+differently. The nft-FT baseline balances load with an nftables hash map
+instead of IPVS, because IPVS connections are not offloaded to the
+flowtable. Disabling checksum offload lowers absolute TCP throughput equally
+for all configurations. The HTTP connection rate is bounded by Python
+servers, and the flood rate by a Python sender. The microbenchmark measures
+the program alone, without driver and stack costs; its repeat loop keeps
+state hot in the cache, and repeated measurements of the same configuration
+differ by up to about 30~ns. The T3 distribution test has low statistical
+power, which the in-kernel test (f) compensates for.
+
+%=====================================================================
+\section{Conclusion}
+%=====================================================================
+We designed, implemented and evaluated an eBPF/XDP gateway data plane that
+moves the SDN switch into the Linux kernel. One verified pipeline provides a
+stateful firewall over the client-visible flow, an L4 load balancer with
+DNAT/SNAT, graceful draining that spreads a drained backend's share evenly,
+recovery of evicted NAT state and $O(1)$ checksum maintenance, and per-flow
+telemetry at either the XDP or the TC hook; a libbpf-based control plane
+reprograms it at runtime and expires connection state like OpenFlow
+timeouts. The implementation passes 129 of 130 automated unit and kernel
+tests (one skipped because of a kernel test-harness limitation) and every
+end-to-end scenario at both hooks. In 10 interleaved, pinned rounds on
+emulated veth links with empty rule tables, it reaches 9.9--10.6~Gbit/s of
+TCP throughput and 510--602~kpps for 64-byte packets on the routed path, and
+8.9--9.7~Gbit/s and 487--552~kpps through the load balancer. At the TC hook
+this is statistically indistinguishable from OVS with connection tracking
+and 18\% above nftables with IPVS in routed TCP throughput. The kernel's
+flowtable fast path, however, outperforms every eBPF configuration, which
+are 11--25\% slower, and with all ten rule patterns populated the eBPF data plane
+loses 11--16\% of its routed TCP throughput and falls 6--14\% behind OVS with
+connection tracking, which, like the flowtable, evaluates rules only when a
+flow is set up. Measured in the kernel, an admitted packet costs 68--79~ns
+with empty rule tables, independent of the number of tracked connections
+(0--60\,000), and 224--270~ns when all ten rule patterns are populated,
+independent of the number of rules (10--10\,000); cache misses raise it to 0.29--0.52~$\mu$s with
+15\,000 flows in random order. A dropped packet costs 60--67~ns, and
+splitting the pipeline into tail-called programs adds 30--40\% on the pass
+and DNAT paths when state is cold. The main lesson is that, for an in-kernel
+gateway, the work spent on an established packet matters more than the hook.
+Future work will therefore add a per-flow verdict cache with generation-based
+invalidation, which keeps rule changes immediate while removing the
+per-pattern cost; evaluate the system on physical NICs with native XDP support
+and hardware traffic generators; seed the selection hash per boot; replace
+the active-list modulo selection with Maglev-style
+consistent hashing \cite{eisenbud2016maglev} to reduce remapping when pools
+change, use batched map operations in the reaper, and add prefix (LPM) rules.
+
+%=====================================================================
+\input{appendix_figs}
+
+%=====================================================================
+\begin{thebibliography}{00}
+\bibitem{kreutz2015sdn} D. Kreutz, F. M. V. Ramos, P. E. Ver\'issimo,
+C. E. Rothenberg, S. Azodolmolky, and S. Uhlig, ``Software-defined networking:
+A comprehensive survey,'' \textit{Proc. IEEE}, vol.~103, no.~1, pp.~14--76,
+Jan. 2015, doi: 10.1109/JPROC.2014.2371999.
+
+\bibitem{feamster2014road} N. Feamster, J. Rexford, and E. Zegura, ``The road
+to SDN: An intellectual history of programmable networks,'' \textit{ACM
+SIGCOMM Comput. Commun. Rev.}, vol.~44, no.~2, pp.~87--98, Apr. 2014,
+doi: 10.1145/2602204.2602219.
+
+\bibitem{mckeown2008openflow} N. McKeown, T. Anderson, H. Balakrishnan,
+G. Parulkar, L. Peterson, J. Rexford, S. Shenker, and J. Turner, ``OpenFlow:
+Enabling innovation in campus networks,'' \textit{ACM SIGCOMM Comput. Commun.
+Rev.}, vol.~38, no.~2, pp.~69--74, Apr. 2008, doi: 10.1145/1355734.1355746.
+
+\bibitem{pfaff2015ovs} B. Pfaff, J. Pettit, T. Koponen, E. Jackson, A. Zhou,
+J. Rajahalme, J. Gross, A. Wang, J. Stringer, P. Shelar, K. Amidon, and
+M. Casado, ``The design and implementation of Open vSwitch,'' in \textit{Proc.
+12th USENIX Symp. Netw. Syst. Design Implement. (NSDI)}, Oakland, CA, USA,
+2015, pp.~117--130.
+
+\bibitem{hoiland2018xdp} T. H{\o}iland-J{\o}rgensen, J. D. Brouer,
+D. Borkmann, J. Fastabend, T. Herbert, D. Ahern, and D. Miller, ``The eXpress
+data path: Fast programmable packet processing in the operating system
+kernel,'' in \textit{Proc. 14th Int. Conf. Emerg. Netw. Exp. Technol.
+(CoNEXT)}, Heraklion, Greece, 2018, pp.~54--66, doi: 10.1145/3281411.3281443.
+
+\bibitem{vieira2020ebpf} M. A. M. Vieira, M. S. Castanho, R. D. G. Pac\'ifico,
+E. R. S. Santos, E. P. M. C\^amara J\'unior, and L. F. M. Vieira, ``Fast packet
+processing with eBPF and XDP: Concepts, code, challenges, and applications,''
+\textit{ACM Comput. Surv.}, vol.~53, no.~1, pp.~1--36, Feb. 2020,
+doi: 10.1145/3371038.
+
+\bibitem{cilium} Cilium Authors, ``Cilium: eBPF-based networking,
+observability, and security,'' 2025. [Online]. Available:
+https://cilium.io (accessed Nov. 17, 2026).
+
+\bibitem{katran} Meta Platforms, ``Katran: A high performance layer 4 load
+balancer,'' 2025. [Online]. Available:
+https://github.com/facebookincubator/katran (accessed Nov. 17, 2026).
+
+\bibitem{miano2021polycube} S. Miano, F. Risso, M. V. Bernal, M. Bertrone, and
+Y. Lu, ``A framework for eBPF-based network functions in an era of
+microservices,'' \textit{IEEE Trans. Netw. Service Manag.}, vol.~18, no.~1,
+pp.~133--151, Mar. 2021, doi: 10.1109/TNSM.2021.3055676.
+
+\bibitem{bosshart2014p4} P. Bosshart, D. Daly, G. Gibb, M. Izzard,
+N. McKeown, J. Rexford, C. Schlesinger, D. Talayco, A. Vahdat, G. Varghese,
+and D. Walker, ``P4: Programming protocol-independent packet processors,''
+\textit{ACM SIGCOMM Comput. Commun. Rev.}, vol.~44, no.~3, pp.~87--95,
+Jul. 2014, doi: 10.1145/2656877.2656890.
+
+\bibitem{tu2021ovs} W. Tu, Y.-H. Wei, G. Antichi, and B. Pfaff, ``Revisiting
+the Open vSwitch dataplane ten years later,'' in \textit{Proc. ACM SIGCOMM
+Conf.}, 2021, pp.~245--257, doi: 10.1145/3452296.3472914.
+
+\bibitem{chaignon2018oko} P. Chaignon, K. Lazri, J. Fran\c{c}ois, T. Delmas,
+and O. Festor, ``Oko: Extending Open vSwitch with stateful filters,'' in
+\textit{Proc. Symp. SDN Res. (SOSR)}, Los Angeles, CA, USA, 2018, pp.~1--13,
+doi: 10.1145/3185467.3185496.
+
+\bibitem{miano2018creating} S. Miano, M. Bertrone, F. Risso, M. Tumolo, and
+M. V. Bernal, ``Creating complex network services with eBPF: Experience and
+lessons learned,'' in \textit{Proc. IEEE 19th Int. Conf. High Perform.
+Switching Routing (HPSR)}, Bucharest, Romania, 2018, pp.~1--8,
+doi: 10.1109/HPSR.2018.8850758.
+
+\bibitem{miano2019bpfiptables} S. Miano, M. Bertrone, F. Risso, M. V. Bernal,
+Y. Lu, and J. Pi, ``Securing Linux with a faster and scalable iptables,''
+\textit{ACM SIGCOMM Comput. Commun. Rev.}, vol.~49, no.~3, pp.~2--17,
+Jul. 2019, doi: 10.1145/3371927.3371929.
+
+\bibitem{scholz2018filtering} D. Scholz, D. Raumer, P. Emmerich, A. Kurtz,
+K. Lesiak, and G. Carle, ``Performance implications of packet filtering with
+Linux eBPF,'' in \textit{Proc. 30th Int. Teletraffic Congr. (ITC)}, Vienna,
+Austria, 2018, pp.~209--217, doi: 10.1109/ITC30.2018.00039.
+
+\bibitem{nftables} Netfilter Project, ``nftables,'' 2025. [Online].
+Available: https://netfilter.org/projects/nftables/ (accessed Nov. 17, 2026).
+
+\bibitem{zhang2000lvs} W. Zhang, ``Linux Virtual Server for scalable network
+services,'' in \textit{Proc. Ottawa Linux Symp.}, Ottawa, ON, Canada,
+Jul. 2000.
+
+\bibitem{eisenbud2016maglev} D. E. Eisenbud, C. Yi, C. Contavalli, C. Smith,
+R. Kononov, E. Mann-Hielscher, A. Cilingiroglu, B. Cheyney, W. Shang, and
+J. D. Hosein, ``Maglev: A fast and reliable software network load balancer,''
+in \textit{Proc. 13th USENIX Symp. Netw. Syst. Design Implement. (NSDI)},
+Santa Clara, CA, USA, 2016, pp.~523--535.
+
+\bibitem{srinivasan1999tss} V. Srinivasan, S. Suri, and G. Varghese, ``Packet
+classification using tuple space search,'' in \textit{Proc. ACM SIGCOMM
+Conf.}, Cambridge, MA, USA, 1999, pp.~135--146, doi: 10.1145/316188.316216.
+
+\bibitem{lantz2010mininet} B. Lantz, B. Heller, and N. McKeown, ``A network in
+a laptop: Rapid prototyping for software-defined networks,'' in \textit{Proc.
+9th ACM SIGCOMM Workshop Hot Topics Netw. (HotNets)}, Monterey, CA, USA, 2010,
+Art. no.~19, doi: 10.1145/1868447.1868466.
+
+\bibitem{rfc1624} A. Rijsinghani, ``Computation of the Internet checksum via
+incremental update,'' RFC 1624, IETF, May 1994, doi: 10.17487/RFC1624.
+
+\bibitem{rfc1071} R. Braden, D. Borman, and C. Partridge, ``Computing the
+Internet checksum,'' RFC 1071, IETF, Sep. 1988, doi: 10.17487/RFC1071.
+
+\bibitem{rfc768} J. Postel, ``User datagram protocol,'' RFC 768, IETF,
+Aug. 1980, doi: 10.17487/RFC0768.
+
+\bibitem{kuo2022kfuse} H.-C. Kuo, K.-H. Chen, Y. Lu, D. Williams, S. Mohan,
+and T. Xu, ``Verified programs can party: Optimizing kernel extensions via
+post-verification merging,'' in \textit{Proc. 17th Eur. Conf. Comput. Syst.
+(EuroSys)}, Rennes, France, 2022, pp.~283--299, doi: 10.1145/3492321.3519562.
+
+\bibitem{miano2022morpheus} S. Miano, A. Sanaee, F. Risso, G. R\'etv\'ari,
+and G. Antichi, ``Domain specific run time optimization for software data
+planes,'' in \textit{Proc. 27th ACM Int. Conf. Archit. Support Program.
+Lang. Oper. Syst. (ASPLOS)}, Lausanne, Switzerland, 2022, pp.~1148--1164,
+doi: 10.1145/3503222.3507769.
+
+\bibitem{nfflowtable} Linux Kernel Documentation, ``Netfilter's flowtable
+infrastructure,'' 2026. [Online]. Available:
+https://docs.kernel.org/networking/nf\_flowtable.html (accessed Nov. 18, 2026).
+\end{thebibliography}
+
+\end{document}

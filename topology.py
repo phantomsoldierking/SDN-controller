@@ -11,6 +11,7 @@ Modes
   ebpf    Linux router + xdp_prog (XDP by default, --hook tc for TC)
   kernel    Linux router without eBPF (baseline, no policy)
   nft-ipvs  Linux router + nftables (stateful firewall) + IPVS (L4 load balancer)
+  nft-ft    Linux router + nftables with NAT load balancing and the flowtable fast path
   ovs       Open vSwitch acting as the gateway through stateless OpenFlow 1.3 rules
   ovs-ct    Open vSwitch with connection tracking and NAT (ct/nat actions)
 
@@ -46,7 +47,7 @@ from testbed.report import Report  # noqa: E402
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["ebpf", "kernel", "nft-ipvs", "ovs", "ovs-ct"],
+    ap.add_argument("--mode", choices=["ebpf", "kernel", "nft-ipvs", "nft-ft", "ovs", "ovs-ct"],
                     default="ebpf")
     ap.add_argument("--hook", choices=["xdp", "tc"], default="xdp")
     ap.add_argument("--xdp-mode", choices=["auto", "native", "generic"], default="auto")
@@ -56,6 +57,8 @@ def parse_args():
     ap.add_argument("--requests", type=int, default=25, help="HTTP requests per client")
     ap.add_argument("--duration", type=int, default=10, help="iperf3 seconds")
     ap.add_argument("--bench-out", help="write Test 4 JSON here")
+    ap.add_argument("--bg-rules", type=int, default=0,
+                    help="install N non-matching rules populating all ten rule patterns")
     ap.add_argument("--report-out", help="write the PASS/FAIL report of Tests 1-3 as JSON here")
     ap.add_argument("--cli", action="store_true", help="drop into the Mininet CLI afterwards")
     a = ap.parse_args()
@@ -82,8 +85,12 @@ def run(a, net, gw, report: Report, workdir: str) -> None:
                 gw.add_service(BENCH_VIP, BENCH_PORT, [host("s2")], proto)
         except Unsupported:
             pass
+    if a.bg_rules:
+        from testbed.rules import background_rules
+        gw.install_background_rules(background_rules(a.bg_rules))
     if "4" in a.tests:
-        benchmark.run(net, gw, report, a.duration, a.requests * 4, a.bench_out, workdir)
+        benchmark.run(net, gw, report, a.duration, a.requests * 4, a.bench_out, workdir,
+                      a.bg_rules)
     if a.tests and gw.report():
         print("\n*** Data-plane counters")
         print(gw.report())

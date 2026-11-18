@@ -137,6 +137,22 @@ class Firewall:
                     [(k.saddr, k.daddr) for k in keys if k.kind == FwKind.IP])
         return len(keys)
 
+    def add_many(self, rules: list[FirewallRule]) -> int:
+        """Install many rules with a single pattern-mask update (bulk loading)."""
+        n = 0
+        with self._lock:
+            for rule in rules:
+                action = parse_action(rule.action)
+                keys = rule.keys()
+                for k in keys:
+                    self._rules.update(k, FwRule(action=action))
+                n += len(keys)
+                if action == Action.DROP:
+                    self._conntrack.flush_matching(
+                        [(k.saddr, k.daddr) for k in keys if k.kind == FwKind.IP])
+            self._sync_pattern_mask()
+        return n
+
     def delete(self, rule: FirewallRule) -> int:
         with self._lock:
             n = sum(self._rules.delete(k) for k in rule.keys())

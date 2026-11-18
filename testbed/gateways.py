@@ -6,6 +6,8 @@ forwards, filters and balances traffic depends on the implementation:
     KernelGateway    Linux router, no policy (baseline)
     EbpfGateway      Linux router + the eBPF data plane, driven through REST
     NetfilterGateway Linux router + nftables (stateful firewall) + IPVS (L4 LB)
+    NftFlowtableGateway Linux router + nftables with NAT load balancing and the
+                     software flowtable fast path (nf_flow_table)
     OvsGateway       Open vSwitch, stateless OpenFlow 1.3 rules (classical SDN)
     OvsCtGateway     Open vSwitch with connection tracking and NAT (ct/nat actions)
 """
@@ -25,6 +27,7 @@ from dataclasses import dataclass, field
 from .config import API_LISTEN, CONTROL_PLANE, HOSTS, OVS_GW_MAC, PYTHON, Host
 from .cpus import AUX_CPUS
 from .net import disable_tx_offload, sh
+from .rules import nft_ruleset, of_match
 
 log = logging.getLogger("testbed")
 
@@ -86,6 +89,11 @@ class Gateway(ABC):
 
     def drop_count(self) -> int:
         raise Unsupported(f"{self.label} has no in-kernel drop counter")
+
+    def install_background_rules(self, rules) -> None:
+        """Install non-matching rules that populate every rule pattern
+        (testbed.rules.background_rules), each gateway in its own form."""
+        raise Unsupported(f"{self.label} has no firewall")
 
     def lb_connections(self, vip: str, port: int) -> int:
         """Number of tracked load-balanced connections of a TCP service."""
@@ -199,6 +207,29 @@ class EbpfGateway(KernelGateway):
     def drop_count(self) -> int:
         return self.rest("GET", "/stats")["drop_firewall"]
 
+    def install_background_rules(self, rules) -> None:
+        # Bulk-written into the pinned maps from inside the gateway node (whose
+        # view of /sys/fs/bpf holds them); the pattern mask is derived from the
+        # map contents, so the daemon's later updates keep it consistent.
+        from dataclasses import asdict
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump([asdict(r) for r in rules], f)
+        script = ("import json,sys; sys.path.insert(0, %r); "
+                  "from sdn.dataplane import DataPlane, FirewallRule; "
+                  "dp = DataPlane.open(); "
+                  "print(dp.firewall.add_many([FirewallRule(**r) for r in json.load(open(%r))]))"
+                  % (os.path.dirname(CONTROL_PLANE), f.name))
+        try:
+            out = sh(self.node, f"{PYTHON} -c {shlex.quote(script)}", check=True).strip()
+        finally:
+            os.unlink(f.name)
+        print(f"*** {out} background rule keys installed (all ten patterns populated)")
+
+    def table_sizes(self) -> dict:
+        """Entries per connection table (the reaper sweeps these every 2 s)."""
+        tables = self.rest("GET", "/conntrack")
+        return {name: len(entries) for name, entries in tables.items()}
+
     def lb_connections(self, vip, port) -> int:
         tables = self.rest("GET", "/conntrack")
         fwd = [e for e in tables["lb"] if (e["dst"], e["dport"]) == (vip, port)]
@@ -257,6 +288,18 @@ class NetfilterGateway(KernelGateway):
         m = re.search(r"packets (\d+)", self._sh("nft list counter inet sdn fwdrop"))
         return int(m.group(1)) if m else 0
 
+    def _nft_script(self, script: str) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".nft", delete=False) as f:
+            f.write(script)
+        try:
+            self._sh(f"nft -f {f.name}")
+        finally:
+            os.unlink(f.name)
+
+    def install_background_rules(self, rules) -> None:
+        self._nft_script(nft_ruleset("sdn", "forward", rules))
+        print(f"*** {len(rules)} background rules installed (one nftables set per pattern)")
+
     @staticmethod
     def _flag(proto: str) -> str:
         return "-u" if proto == "udp" else "-t"
@@ -282,6 +325,80 @@ class NetfilterGateway(KernelGateway):
 
     def stop(self) -> None:
         self.node.cmd("ipvsadm -C; nft delete table inet sdn")
+
+
+class NftFlowtableGateway(NetfilterGateway):
+    """nftables only, with the software flowtable fast path (nf_flow_table).
+
+    Load balancing uses nftables DNAT (`jhash` of the client address and port
+    over the active backends); conntrack un-NATs the replies. Established
+    TCP/UDP connections are offloaded to a flowtable at the ingress hook, so
+    their packets bypass routing and the forward chain - the kernel's own
+    counterpart of the eBPF program's in-program FIB forwarding. Drop rules
+    stay ahead of the offload in the forward chain; a new drop rule flushes
+    matching conntrack (and thereby flowtable) entries, as in the eBPF design.
+    """
+    label = "nft-ft"
+
+    def start(self) -> None:
+        KernelGateway.start(self)
+        devices = ", ".join(h.gw_intf for h in HOSTS)
+        self._nft_script(
+            "table inet sdn {\n"
+            "  counter fwdrop { }\n"
+            f"  flowtable ft {{ hook ingress priority 0; devices = {{ {devices} }}; }}\n"
+            "  chain prerouting { type nat hook prerouting priority -100; policy accept; }\n"
+            "  chain forward { type filter hook forward priority 0; policy accept;\n"
+            "    meta l4proto { tcp, udp } flow add @ft\n"
+            "    ct state established,related accept\n  }\n}\n")
+        self._rules: dict[tuple, list[int]] = {}
+        self._svc_handles: dict[tuple, int] = {}
+
+    def block(self, src, dst, proto="any", dport=0, bidir=True) -> None:
+        super().block(src, dst, proto, dport, bidir)
+        # established (possibly offloaded) flows must not bypass the new rule
+        for s, d in [(src, dst)] + ([(dst, src)] if bidir else []):
+            self.node.cmd(f"conntrack -D -s {s} -d {d} >/dev/null 2>&1")
+
+    def _dnat_rule(self, svc: Service) -> str:
+        active = [b for b in svc.backends if b.name in svc.active]
+        if len(active) == 1:
+            target = active[0].ip
+        else:
+            entries = ", ".join(f"{i} : {b.ip}" for i, b in enumerate(active))
+            target = (f"jhash ip saddr . {svc.proto} sport mod {len(active)} "
+                      f"map {{ {entries} }}")
+        return (f"ip daddr {svc.vip} {svc.proto} dport {svc.port} "
+                f"dnat ip to {target}")
+
+    def _write_service(self, svc: Service) -> None:
+        key = (svc.vip, svc.port, svc.proto)
+        rule = self._dnat_rule(svc)
+        if key in self._svc_handles:
+            self._sh(f"nft replace rule inet sdn prerouting handle {self._svc_handles[key]} "
+                     f"{rule}")
+        else:
+            out = self._sh(f"nft --echo --handle add rule inet sdn prerouting {rule}")
+            self._svc_handles[key] = int(re.search(r"# handle (\d+)", out).group(1))
+
+    def add_service(self, vip, port, backends, proto="tcp") -> None:
+        svc = self._register(vip, port, backends, proto)
+        if svc:
+            self._write_service(svc)
+
+    def set_backend(self, vip, port, backend, up, proto="tcp") -> None:
+        # existing connections keep their conntrack NAT binding (graceful drain)
+        svc = self.services[(vip, port, proto)]
+        (svc.active.add if up else svc.active.discard)(backend.name)
+        self._write_service(svc)
+
+    def lb_connections(self, vip, port) -> int:
+        out = self.node.cmd("cat /proc/net/nf_conntrack")
+        return sum(1 for line in out.splitlines()
+                   if " tcp " in line and f"dst={vip} " in line and f"dport={port} " in line)
+
+    def stop(self) -> None:
+        self.node.cmd("nft delete table inet sdn")
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +465,19 @@ class OvsGateway(Gateway):
         return sum(int(m.group(1)) for line in out.splitlines()
                    if f"priority={self.ACL_PRIORITY}," in line and "actions=drop" in line
                    for m in [re.search(r"n_packets=(\d+)", line)] if m)
+
+    def install_background_rules(self, rules) -> None:
+        flows = [f"table=0,priority={self.ACL_PRIORITY - 10},{of_match(r)},actions=drop"
+                 for r in rules]
+        with tempfile.NamedTemporaryFile("w", suffix=".flows", delete=False) as f:
+            f.write("\n".join(flows) + "\n")
+        try:
+            out = self.node.cmd(f"ovs-ofctl -O OpenFlow13 add-flows gw {f.name}")
+            if out.strip():
+                raise RuntimeError(f"ovs-ofctl add-flows: {out}")
+        finally:
+            os.unlink(f.name)
+        print(f"*** {len(rules)} background rules installed (OpenFlow ACL flows)")
 
     def _bucket(self, b: Host, svc: Service) -> str:
         return (f"bucket=set_field:{b.ip}->ip_dst,set_field:{OVS_GW_MAC}->eth_src,"
@@ -422,5 +552,7 @@ def make_gateway(net, mode: str, hook: str = "xdp", xdp_mode: str = "auto",
         return OvsCtGateway(net)
     if mode == "nft-ipvs":
         return NetfilterGateway(net)
+    if mode == "nft-ft":
+        return NftFlowtableGateway(net)
     return KernelGateway(net)
 

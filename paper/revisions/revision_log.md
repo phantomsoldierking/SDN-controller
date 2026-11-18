@@ -9,7 +9,8 @@ Stateful Firewalling and L4 Load Balancing Compared with Open vSwitch
 |---|---|---|
 | Initial draft | `paper/versions/v0_draft.pdf` | Round 1 |
 | Revision 1 | `paper/versions/v1_revision1.pdf` | Round 2 |
-| Revision 2 | `paper/versions/v2_revision2.pdf` | Round 3 (recommended) |
+| Revision 2 | `paper/versions/v2_revision2.pdf` | Round 3 |
+| Revision 3 | `paper/versions/v3_revision3.pdf` | Round 4 (recommended) |
 
 ---
 
@@ -183,3 +184,86 @@ Note: about 40 comparisons are reported without multiple-comparison correction; 
 - Microbenchmark (`results/rev2/microbench.json`): rules, conntrack, cache-cold, paths (incl. new connections), tail-call ablation, 20,000-connection uniformity, reaper sweep.
 - Environment: `results/rev2/environment.txt`.
 - Paper: `paper/versions/v2_revision2.pdf` (11 pages) and `.tex`.
+
+
+---
+
+## Round 3: review of Revision 2 (v2) → Revision 3 (v3)
+
+Full reviewer output: `paper/revisions/round3_comments.md`
+
+As before, comments about the implementation's behaviour were fixed in code
+first, each with a regression test, and all experiments were re-run from
+scratch (`results/rev3/`, 2026-11-18, 13 configurations × 10 interleaved
+rounds). The user additionally asked for 12–14 supplementary figures with
+95% confidence intervals; they form the new Appendix (Figs. 4–17, Table VI).
+
+### A. Framing and conclusions
+
+| # | Reviewer comment (summary) | Response and changes | Type |
+|---|---|---|---|
+| R3.W1 / R3.E3 | TC+FIB (stack bypass) compared only with un-offloaded nft+IPVS; consider `nf_flow_table` | **New baseline nft-FT** (`testbed/gateways.py: NftFlowtableGateway`): nftables DNAT via jhash map + software flowtable for established TCP/UDP, drop rules before offload, conntrack flush on rule add. Result: nft-FT is the fastest stateful configuration; every eBPF configuration is 11–25% slower (TC+FIB −19.7±5.2% routed TCP, p<0.001). The paper now says the TC+FIB advantage over nft+IPVS comes mostly from bypassing the forwarding path. Related work, §V-A, §VI-C, §VI-F, abstract and conclusion updated | Code, Exp, Text |
+| R3.W2 / R3.E4 | Tail-call ablation: mixed denominators, re-parsing not isolated, single-shot pass not measured, KFuse/Morpheus | **Second chained variant** (`bpf/chain.h`, `xdp_chainm_*`) shares the parse result through a per-CPU map; both variants measured repeat-loop and single-shot incl. pass; raw and harness-adjusted percentages reported. Result: no measurable chaining cost when hot; +46–67 ns (+30–31% raw, +38–40% adjusted) single-shot on pass/DNAT; sharing metadata is *slower* than re-parsing. The previous 33–47% claim is withdrawn. KFuse and Morpheus cited (§II) | Code, Exp, Text |
+| R3.W3 / R3.E2 | Macro-benchmarks only with empty rule tables | **"+rules" configurations**: 1000 non-matching rules over all ten patterns in each system's idiomatic form (`testbed/rules.py`: BPF maps, nftables concatenated sets, OpenFlow ACL flows) for TC, TC+FIB, nft+IPVS, nft-FT, OVS-ct. Result: eBPF loses 11–16% routed TCP; nft+IPVS 31%; nft-FT and OVS-ct no measurable change, so eBPF falls 6–14% behind OVS-ct on most metrics. Discussion proposes a per-flow verdict cache | Code, Exp, Text |
+| R3.F1 | "the latter" antecedent in abstract | Sentence rewritten; the abstract names each baseline explicitly | Text |
+| R3.F2 | Rule- and connection-scaling claims merged | Abstract and conclusion separate them (connections measured with empty tables, rules with all patterns) | Text |
+| R3.m1 | 25–32% savings vs 33–47% overhead | Both replaced by one, re-measured statement (30–40% cold, ~0 hot) | Text |
+| R3.m2 | DOI consistency | DOIs added to all entries that have one (incl. [2], [13]); new references verified against Crossref | Text |
+
+### B. Formal model and data-plane semantics
+
+| # | Reviewer comment (summary) | Response and changes | Type |
+|---|---|---|---|
+| R3.M1 | Forward vs reply direction in T_fw; directional rule semantics under κ | §III-D defines a reply for T_fw (LB REPLY or reverse-key hit), states that flags are a union, and that pattern rules on VIP traffic are connection predicates over the client-visible key | Text |
+| R3.M2 | Backend replacement/removal vs LRU recovery | **Fixed in code.** Backends keep fixed slots when a service is redefined; removed/replaced backends have their state flushed (`conntrack.flush_backend`); replies are checked against the backend slot (`lb_slot_holds`) and a stale slot isolates the reply; recovery verifies `be_idx`. Tests: `test_replacing_a_service_keeps_backend_slots`, `test_removed_backend_state_is_flushed`, `test_reply_from_replaced_backend_slot_is_isolated` | Code, Text |
+| R3.M3 | Signature of A(k) under ρ=0 | A(k,ρ) defined with shorthand A(k); I₄(ρ) introduced | Text |
+| R3.m3–m6 | "drain flag" polarity; Table I 16×16 partition; r_b(f) undefined; χ² needs n_act ≥ 2 | α renamed "active flag"; caption "16 services × 16 slots"; r_b(f) defined in §III-F; n_act ≥ 2 stated | Text |
+| R3.m7 | Fig. 1 does not show reply classification | Fig. 1 has a "Classify reply" stage | Text |
+
+### C. Pipeline and control plane
+
+| # | Reviewer comment (summary) | Response and changes | Type |
+|---|---|---|---|
+| R3.P1 | Reply classification mutates state before firewall admission | **Fixed in code.** `lb_reply_lookup` is read-only; T_rev/L are refreshed or re-created by `lb_reverse_nat` only after admission. Test: `test_dropped_reply_creates_no_lb_state`. Alg. 1/2 rewritten accordingly | Code, Text |
+| R3.P2 | Redundant overwrites on established hits | In-place refresh instead of full rewrites; `rev_store(..., fresh)` | Code, Text |
+| R3.P3 | Fragments vs isolation, port DROP rules, PMTUD | **Fixed in code.** First fragments carry their ports (`first_frag`, `ff_sport/ff_dport`) and are dropped if they hit an isolated endpoint or a port DROP rule. Tests: `test_first_fragment_to_service_endpoint_is_dropped`, `test_first_fragment_obeys_port_drop_rules`. PMTUD/ICMP limitation stated in §IV-A | Code, Text |
+| R3.P4 | Recovery loop on every new connection | **Fixed in code.** TCP SYNs never enter recovery (`tcp_opening`), so a reused client port cannot be captured by stale reverse state (`test_syn_does_not_rejoin_a_stale_reverse_entry`). New UDP flows still probe n entries; measured: new TCP 1.5–1.7 µs, new UDP 2.0–2.2 µs | Code, Exp, Text |
+| R3.P5 | Reaper deletion ordering, L2/wildcard DROP flush | Reaper re-checks the partner T_rev entry before deleting it (`test_refreshed_reverse_entry_survives_its_partner`); §IV-E states the flush scope and active-list update ordering | Code, Text |
+| R3.m8–m10 | UDP zero checksum in XDP path; Alg. 2 index bound; T_rev value notation | §IV-C note; `0 ≤ i < n`; T_rev[r_b(f)] ← (v, p_v, σ, j) | Text |
+
+### D. Experimental design and results
+
+| # | Reviewer comment (summary) | Response and changes | Type |
+|---|---|---|---|
+| R3.E1 | 60k-flow cache-cold test confounds cache misses with telemetry LRU eviction | Cold test now at 1k / 15k / 60k flows; 15k fits the 16,384-entry telemetry table. Result: 290 ns (TC) / 524 ns (XDP) already at 15k, so most of the rise is cache misses; eviction adds 145 ns at TC. Baselines stated as zero-rule | Exp, Text |
+| R3.E5 | TC 78–82 ns vs 100 ns contradiction | Re-measured with a longer warm-up: TC 78 ns with empty tables in both sweeps for large tables, but 106/95 ns at 0/1k connections. Reported as transient interference; the paper states a ~30 ns reproducibility limit for repeated measurements | Exp, Text |
+| R3.E6 | Unpaired tests on a paired design; reaper/SMT contention; E-cores | Paired t-tests on per-round relative differences are now primary (Welch for comparison; pairing changed no conclusion). §V-D states daemon/OVS affinity, E-cores enabled, softirq co-location, and that tables held at most 608 entries (sweep ≈ 3 ms) | Code, Exp, Text |
+| R3.E7 | Identical TC/TC+FIB counts in T3 | T3 now records client ports. `testbed/verify_t3.py` replays them through an offline model of the hash: 375/375 eBPF choices reproduced. TC's uneven sample (χ²=12.16, p=0.007) is explained by its port sample; previous identical counts most likely from repeated port sequences (not verifiable). Paper notes the unseeded hash is predictable | Code, Exp, Text |
+| R3.m11 | Table III post-drain p column | Added | Text |
+| R3.m12 | "on the routed path" in hooks bullet | Bullet rewritten for both paths | Text |
+| R3.m13 | OVS p ≤ 0.004 | Superseded by new data (paired p reported) | Text |
+| R3.m14 | "CI as wide as its mean" | Sentence replaced (new data) | Text |
+| R3.m15 | 3 × 65,536 = 196,608 | Stated in the reaper paragraph | Text |
+| User | 12–14 figures with 95% CI at the end | Appendix A: 14 figures (Figs. 4–17), zoomed axes stated in each caption, Table VI index with unit, configurations and data file; generated by `paper/make_figures.py results/rev3` | Text |
+
+### E. How the results changed between Revision 2 and Revision 3
+
+| Revision 2 | Revision 3 (`results/rev3/`) | Why |
+|---|---|---|
+| TC+FIB 16–18% faster than nft+IPVS through the VIP | TC/TC+FIB +18% routed TCP vs nft+IPVS; VIP +7–11% TCP; but 11–25% slower than nft-FT | New flowtable baseline; re-run |
+| eBPF ≈ OVS-ct (empty tables) | Unchanged with empty tables; 6–14% behind OVS-ct with 1000 rules | New populated-rule runs |
+| Tail calls cost 33–47% | ~0 hot; 30–40% single-shot on pass/DNAT; shared metadata slower | Corrected denominators, new variant |
+| 74–100 ns empty tables; 250–295 ns all patterns | 68–79 ns; 224–270 ns | Longer warm-up, re-run |
+| 0.68 µs cold (60k) | 0.29–0.52 µs at 15k; 0.44–0.46 µs at 60k | New sizes separate eviction |
+| TC+FIB −34% RTT vs TC (p=0.002) | −11.5±35.4% (p=0.48): not reproduced | Re-run |
+| New connection 2.1–2.4 µs | TCP SYN 1.5–1.7 µs (no recovery probes); UDP 2.0–2.2 µs | SYN rule |
+| Stateful cost vs kernel 13.6–26.9% | Kernel had an outlier round (5.5 Gbit/s); excluding it: eBPF 13.6–20.4%, OVS-ct 17.5%, nft+IPVS 25.8%; nft-FT ≈ kernel | Re-run; sensitivity check stated |
+
+### Summary of new evidence in Revision 3
+
+- Automated tests: 130 (45 unit, 85 kernel = 42 cases × 2 hooks + 1 chain-equivalence test for both chained variants); 129 pass, 1 skipped (TC truncated frame).
+- Functional scenarios (`results/rev3/scenarios/`): all seven configurations incl. nft-FT pass every applicable check; client ports recorded; `python3 testbed/verify_t3.py results/rev3` reproduces 375/375 eBPF backend choices.
+- Benchmarks (`results/rev3/raw/`): 8 configurations + 5 "+rules" variants × 10 interleaved rounds, routed and VIP paths, paired tests.
+- Microbenchmark (`results/rev3/microbench.json`): rules, conntrack, cold (1/1k/15k/60k), paths incl. new TCP/UDP, two chained variants, uniformity, reaper.
+- Environment: `results/rev3/environment.txt`.
+- Paper: `paper/versions/v3_revision3.pdf` (16 pages incl. 4-page figure appendix) and `.tex` (+ `v3_revision3_appendix_figs.tex`).

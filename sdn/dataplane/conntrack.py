@@ -75,6 +75,19 @@ class ConnTrack:
                     n += self._rev.delete(k)
         return n
 
+    def flush_backend(self, ip: int, port: int, proto: int) -> int:
+        """Delete the load-balancer state of every connection served by backend
+        endpoint (ip, port, proto); used when a backend is removed or replaced."""
+        n = 0
+        with self._lock:
+            for k, v in self._lb.items():
+                if (v.backend_ip, v.backend_port, k.proto) == (ip, port, proto):
+                    n += self._lb.delete(k)
+            for k in self._rev.keys():
+                if (k.saddr, k.sport, k.proto) == (ip, port, proto):
+                    n += self._rev.delete(k)
+        return n
+
     @staticmethod
     def _reply_key(fwd: FlowKey, v) -> FlowKey:
         return FlowKey(saddr=v.backend_ip, daddr=fwd.saddr, sport=v.backend_port,
@@ -110,7 +123,11 @@ class ConnTrack:
             for k, v in self._lb.items():
                 if fw_dead(v) and self._delete_if_expired(self._lb, k, fw_dead):
                     removed["lb_conntrack"] += 1
-                    removed["lb_reverse"] += self._rev.delete(self._reply_key(k, v))
+                    # The partner is re-read and judged on its own: if a packet
+                    # refreshed it meanwhile, it survives and the data plane
+                    # re-creates the forward entry from it (Section III-F).
+                    removed["lb_reverse"] += self._delete_if_expired(
+                        self._rev, self._reply_key(k, v), rev_dead)
             for k, v in self._rev.items():  # orphans whose forward entry is gone
                 if rev_dead(v):
                     removed["lb_reverse"] += self._delete_if_expired(self._rev, k, rev_dead)

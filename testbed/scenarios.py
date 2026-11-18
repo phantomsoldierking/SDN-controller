@@ -51,13 +51,16 @@ def test_load_balancer(net, gw: Gateway, report: Report, requests: int) -> None:
     url = f"http://{VIP}:{VPORT}/"
     totals: dict[str, int] = {}
     fails = 0
+    conns: dict[str, list] = {}
     for c in CLIENTS:
         r = probe(net.get(c.name), url, requests)
         print(f"    {c.name}: ok={r['ok']} fail={r['fail']} backends={r['backends']}")
         fails += r["fail"]
+        conns[c.name] = r.get("connections", [])  # [client port, backend] per connection
         for backend, n in r["backends"].items():
             totals[backend] = totals.get(backend, 0) + n
     report.data["t3_backend_counts"] = {s.name: totals.get(s.name, 0) for s in SERVERS}
+    report.data["t3_connections"] = conns
     answered = sum(totals.values())
     report.add("T3a all requests to VIP answered", fails == 0 and answered > 0,
                f"{answered} ok, {fails} failed")
@@ -79,6 +82,7 @@ def test_load_balancer(net, gw: Gateway, report: Report, requests: int) -> None:
         return
     r = probe(net.get(CLIENTS[0].name), url, requests)
     report.data["t3_after_drain"] = r["backends"]
+    report.data["t3_after_drain_connections"] = r.get("connections", [])
     report.add(f"T3d drained backend {drained.name} receives no new connections",
                r["fail"] == 0 and drained.name not in r["backends"], str(r["backends"]))
     gw.set_backend(VIP, VPORT, drained, up=True)
