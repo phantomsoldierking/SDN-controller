@@ -394,6 +394,90 @@ class _DataPlaneCases:
         self.assertNotEqual(self.backend_for(43120, flags=0x02), old)
         self.assertEqual(self.counter("lb_recovered"), before)
 
+    # ---- reused tuples and recovery (review round 4) ----
+    def test_syn_on_draining_backend_entry_is_placed_afresh(self):
+        """A SYN that reuses the tuple of a connection whose backend is now
+        draining must not join that backend; the old reverse entry goes."""
+        self.add_service()
+        old = self.backend_for(43200)
+        self.dp.lb.set_backend_state(VIP, 80, old, up=False)
+        new = self.backend_for(43200, flags=0x02)
+        self.assertNotEqual(new, old)
+        self.assertIsNone(self.dp.maps["lb_reverse"].lookup(flow_key(old, C1, 80, 43200, 6)))
+        self.assertIsNotNone(self.dp.maps["lb_reverse"].lookup(flow_key(new, C1, 80, 43200, 6)))
+
+    def test_syn_after_fin_restarts_connection_state(self):
+        """A SYN reusing the tuple of an ended connection does not inherit its
+        FIN flag (short timeout) or its creation time."""
+        self.add_service()
+        self.backend_for(43210)
+        self.backend_for(43210, flags=0x11)                  # FIN|ACK
+        ended = self.lb_entry(43210)
+        self.assertTrue(ended.flags & abi.CT_F_FIN)
+        self.backend_for(43210, flags=0x02)                  # new SYN
+        fresh = self.lb_entry(43210)
+        self.assertFalse(fresh.flags & abi.CT_F_FIN)
+        self.assertGreater(fresh.created_ns, ended.created_ns)
+        fw = self.dp.maps["fw_conntrack"].lookup(flow_key(C1, VIP, 43210, 80, 6))
+        self.assertFalse(fw.flags & abi.CT_F_FIN, "firewall entry restarted as well")
+
+    def test_retransmitted_syn_keeps_live_connection(self):
+        self.add_service()
+        first = self.backend_for(43220)
+        created = self.lb_entry(43220).created_ns
+        self.assertEqual(self.backend_for(43220, flags=0x02), first)
+        self.assertEqual(self.lb_entry(43220).created_ns, created)
+
+    def test_recovery_refreshes_reverse_entry(self):
+        self.add_service()
+        backend = self.backend_for(43230)
+        rk = flow_key(backend, C1, 80, 43230, 6)
+        rev = self.dp.maps["lb_reverse"].lookup(rk)
+        rev.last_seen_ns = 1
+        self.dp.maps["lb_reverse"].update(rk, rev)
+        self.dp.maps["lb_conntrack"].delete(flow_key(C1, VIP, 43230, 80, 6))
+        self.assertEqual(self.backend_for(43230, flags=0x10), backend)
+        self.assertGreater(self.dp.maps["lb_reverse"].lookup(rk).last_seen_ns, 1)
+
+    def test_recovery_prefers_most_recent_reverse_entry(self):
+        """If a leftover reverse entry of an earlier connection with the same
+        tuple coexists with the live one, recovery restores the live one."""
+        self.add_service()
+        live = self.backend_for(43240)
+        rk = flow_key(live, C1, 80, 43240, 6)
+        rev = self.dp.maps["lb_reverse"].lookup(rk)
+        stale = next(b for b in BACKENDS if b != live)
+        old = abi.LbRev(vip=rev.vip, vport=rev.vport, svc_id=rev.svc_id,
+                        be_idx=BACKENDS.index(stale), last_seen_ns=1)
+        self.dp.maps["lb_reverse"].update(flow_key(stale, C1, 80, 43240, 6), old)
+        self.dp.maps["lb_conntrack"].delete(flow_key(C1, VIP, 43240, 80, 6))
+        self.assertEqual(self.backend_for(43240, flags=0x10), live)
+
+    def test_syn_after_lost_forward_entry_clears_stale_reverse_entry(self):
+        """L[f] was lost while the old reverse entry survived; a SYN reusing the
+        port is placed elsewhere and the old entry is removed, so a late
+        packet from the old backend is isolated instead of translated."""
+        self.add_service()
+        old = self.backend_for(43250)
+        self.dp.lb.set_backend_state(VIP, 80, old, up=False)
+        self.dp.maps["lb_conntrack"].delete(flow_key(C1, VIP, 43250, 80, 6))
+        new = self.backend_for(43250, flags=0x02)
+        self.assertNotEqual(new, old)
+        self.assertIsNone(self.dp.maps["lb_reverse"].lookup(flow_key(old, C1, 80, 43250, 6)))
+        late = P.build(old, C1, 80, 43250, tcp_flags=0x11)
+        self.assertEqual(self.run_packet(late)[0], self.DROP)
+
+    def test_syn_off_draining_backend_restarts_firewall_entry(self):
+        """When the load balancer restarts a reused tuple (draining backend, no
+        FIN seen), the firewall entry restarts with it."""
+        self.add_service()
+        old = self.backend_for(43260)
+        key = flow_key(C1, VIP, 43260, 80, 6)
+        created = self.dp.maps["fw_conntrack"].lookup(key).created_ns
+        self.dp.lb.set_backend_state(VIP, 80, old, up=False)
+        self.assertNotEqual(self.backend_for(43260, flags=0x02), old)
+        self.assertGreater(self.dp.maps["fw_conntrack"].lookup(key).created_ns, created)
+
     def test_first_fragment_to_service_endpoint_is_dropped(self):
         self.add_service()
         self.assertEqual(self.run_packet(P.build(C1, S1, 43130, 80, frag_field=0x2000))[0],

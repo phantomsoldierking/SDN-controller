@@ -21,12 +21,19 @@ the kernel's own measurement of the program's run time.
 a packet the program does not modify (cache-warm, one flow). NAT rewrites the
 packet, so path costs are single-shot (repeat=1 per call); they include a
 constant timing overhead, so paths are compared with the single-shot pass path.
+
+The path and tail-call measurements are interleaved: each batch of every
+(program, path) combination runs in turn, so slow drift (turbo budget, other
+activity) affects all variants alike instead of one block. Unless
+--keep-sibling is given, the SMT sibling of the measurement core is taken
+offline for the run and brought back afterwards.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import signal
 import random
 import statistics
 import sys
@@ -198,28 +205,34 @@ def bench_hook(hook: str, quick: bool) -> dict:
                                               proto=P.UDP),
             "snat_established": lambda i: P.build(backend, C1, 80, 50000, tcp_flags=0x10),
         }
-        res["paths"] = {}
-        for name, make in paths.items():
-            res["paths"][name] = single_shot(obj, make, calls)
-            log(f"path {name}", res["paths"][name])
-        res["pass_repeated"] = repeated(obj, paths["pass"](0), repeat, trials)
-        res["fw_drop_repeated"] = repeated(obj, paths["fw_drop"](0), repeat, trials)
+        main_prog = f"{hook}_dataplane"
+        variants = [("single", main_prog)]
+        if hook == "xdp":
+            variants += [("chain", "xdp_chain_fw"), ("chainm", "xdp_chainm_fw")]
+        chain_paths = ("pass", "dnat_established", "snat_established")
+        jobs = {("single", name): (main_prog, make) for name, make in paths.items()}
+        for variant, entry in variants[1:]:
+            jobs.update({(variant, name): (entry, paths[name]) for name in chain_paths})
+        single = interleaved_single(obj, jobs, calls)
+        rjobs = {}
+        for variant, entry in variants:
+            rjobs[(variant, "pass")] = (entry, paths["pass"](0))
+            rjobs[(variant, "drop")] = (entry, paths["fw_drop"](0))
+        loop = interleaved_repeat(obj, rjobs, repeat, trials)
+
+        res["paths"] = {name: single[("single", name)] for name in paths}
+        for name, st in res["paths"].items():
+            log(f"path {name}", st)
+        res["pass_repeated"] = loop[("single", "pass")]
+        res["fw_drop_repeated"] = loop[("single", "drop")]
         log("pass (repeat loop)", res["pass_repeated"])
         log("drop (repeat loop)", res["fw_drop_repeated"])
-
-        if hook == "xdp":
-            for variant, entry in (("chain", "xdp_chain_fw"), ("chainm", "xdp_chainm_fw")):
-                res[variant] = {
-                    "pass_repeated": repeated(obj, paths["pass"](0), repeat, trials, entry),
-                    "drop_repeated": repeated(obj, paths["fw_drop"](0), repeat, trials, entry),
-                    "pass": single_shot(obj, paths["pass"], calls, program=entry),
-                    "dnat_established": single_shot(obj, paths["dnat_established"], calls,
-                                                    program=entry),
-                    "snat_established": single_shot(obj, paths["snat_established"], calls,
-                                                    program=entry),
-                }
-                for name, st in res[variant].items():
-                    log(f"{variant} {name}", st)
+        for variant, _ in variants[1:]:
+            res[variant] = {"pass_repeated": loop[(variant, "pass")],
+                            "drop_repeated": loop[(variant, "drop")]}
+            res[variant].update({name: single[(variant, name)] for name in chain_paths})
+            for name, st in res[variant].items():
+                log(f"{variant} {name}", st)
 
         reset(dp)
         res["uniformity"] = uniformity(obj, dp, 2_000 if quick else 20_000)
@@ -247,11 +260,69 @@ def bench_hook(hook: str, quick: bool) -> dict:
     return res
 
 
+def interleaved_single(obj: LoadedObject, jobs: dict, calls: int, batches: int = 10) -> dict:
+    """Single-shot samples for several (program, frame factory) jobs, taking one
+    batch of each job in turn; returns {job: summary of batch means}."""
+    size = calls // batches
+    means: dict = {j: [] for j in jobs}
+    for b in range(batches):
+        for job, (program, make) in jobs.items():
+            d = [obj.test_run(make(b * size + i), 1, program)[2] for i in range(size)]
+            means[job].append(statistics.fmean(d))
+    return {j: summarize(m) for j, m in means.items()}
+
+
+def interleaved_repeat(obj: LoadedObject, jobs: dict, repeat: int, trials: int) -> dict:
+    """Repeat-loop samples for several (program, frame) jobs, one trial each in turn."""
+    for program, frame in jobs.values():
+        obj.test_run(frame, 1000, program)
+    samples: dict = {j: [] for j in jobs}
+    for _ in range(trials):
+        for job, (program, frame) in jobs.items():
+            samples[job].append(obj.test_run(frame, repeat, program)[2])
+    return {j: summarize(v) for j, v in samples.items()}
+
+
+def siblings_of(cpu: int) -> list[int]:
+    path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+    try:
+        text = open(path).read().strip()
+    except OSError:
+        return []
+    out: list[int] = []
+    for part in text.split(","):
+        lo, _, hi = part.partition("-")
+        out += list(range(int(lo), int(hi or lo) + 1))
+    return [c for c in out if c != cpu]
+
+
+def is_online(cpu: int) -> bool:
+    try:
+        return open(f"/sys/devices/system/cpu/cpu{cpu}/online").read().strip() != "0"
+    except OSError:
+        return True  # no online file (cpu0) or no hotplug: treat as online
+
+
+def _raise_exit(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+def set_online(cpu: int, online: bool) -> bool:
+    try:
+        with open(f"/sys/devices/system/cpu/cpu{cpu}/online", "w") as f:
+            f.write("1" if online else "0")
+        return True
+    except OSError:
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="results/microbench.json")
     ap.add_argument("--quick", action="store_true", help="fewer repetitions (smoke test)")
+    ap.add_argument("--keep-sibling", action="store_true",
+                    help="leave the SMT sibling of the measurement core online")
     a = ap.parse_args()
     if os.geteuid() != 0:
         sys.exit("microbench needs root (BPF_PROG_TEST_RUN)")
@@ -262,9 +333,26 @@ def main() -> int:
     started = time.strftime("%Y-%m-%dT%H:%M:%S")
     governor = open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").read().strip() \
         if os.path.exists("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") else "n/a"
+    offline = []
+    if CLIENT_CPU and not a.keep_sibling:
+        # A sibling left offline by an interrupted run is adopted and brought
+        # back online at the end like the ones taken offline here.
+        offline = [c for c in siblings_of(int(CLIENT_CPU))
+                   if not is_online(c) or set_online(c, False)]
+        # SIGTERM/SIGHUP (closed terminal, killed sudo) must also reach the
+        # finally clause below, or the sibling stays offline.
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, _raise_exit)
+        if offline:
+            print(f"*** SMT sibling(s) {offline} of CPU {CLIENT_CPU} offline for the run")
+    try:
+        hooks = {hook: bench_hook(hook, a.quick) for hook in ("xdp", "tc")}
+    finally:
+        for c in offline:
+            set_online(c, True)
     result = {"started": started, "kernel": os.uname().release, "cpu": CLIENT_CPU,
-              "governor": governor,
-              "hooks": {hook: bench_hook(hook, a.quick) for hook in ("xdp", "tc")}}
+              "governor": governor, "sibling_offline": offline,
+              "interleaved": ["paths", "chain", "chainm"], "hooks": hooks}
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "w") as f:
         json.dump(result, f, indent=2)

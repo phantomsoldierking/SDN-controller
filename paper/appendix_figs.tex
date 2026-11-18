@@ -2,7 +2,7 @@
 \appendix
 \section{Supplementary Measurement Figures}
 \label{app:figs}
-Figs.~\ref{fig:app-tcp}--\ref{fig:app-newconn} plot the measurements behind Tables~\ref{tab:perf} and \ref{tab:paths} with their 95\% confidence intervals (Student $t$). Value axes are zoomed so that the intervals are visible; each caption gives the axis origin, and differences between bars should be judged against the intervals, not against the axis origin. Table~\ref{tab:figindex} lists every figure with its quantity, the configurations it covers and its data file in the results directory (\texttt{results/rev3}).
+Figs.~\ref{fig:app-tcp}--\ref{fig:app-newconn} plot the measurements behind Tables~\ref{tab:perf} and \ref{tab:paths} with their 95\% confidence intervals (Student $t$). Value axes are zoomed so that the intervals are visible; each caption gives the axis origin, and differences between bars should be judged against the intervals, not against the axis origin. In-kernel panels show the first of the three microbenchmark runs with its within-run intervals; Table~\ref{tab:paths} and Fig.~\ref{fig:scale} give the mean and range over all three. Table~\ref{tab:figindex} lists every figure with its quantity, the configurations it covers and its data file in the results directory (\texttt{results/rev3}).
 
 \begin{table}[!h]
 \caption{Index of the supplementary figures}
@@ -30,7 +30,7 @@ Fig. & Name & Unit & Configurations \\
 \bottomrule
 \end{tabular}
 \\[2pt]
-\parbox{\columnwidth}{\footnotesize Macro-benchmark data: \texttt{rev3/<cfg>.json} (10 interleaved rounds). In-kernel data: \texttt{rev3/microbench.json}.}
+\parbox{\columnwidth}{\footnotesize Macro-benchmark data: \texttt{rev3/<cfg>.json} (10 interleaved rounds). In-kernel data: \texttt{rev4/microbench\_1.json}.}
 \end{table}
 
 \begin{figure*}[!p]\centering
@@ -142,7 +142,7 @@ Fig. & Name & Unit & Configurations \\
 \legend{TCP, 64-B rate}
 \end{axis}
 \end{tikzpicture}
-\captionof{figure}{\textbf{Paired difference to Kernel.} Cost relative to plain kernel routing: per-round paired relative difference, mean $\pm$ 95\% CI (paired $t$).}\label{fig:app-vskernel}
+\captionof{figure}{\textbf{Paired difference to Kernel.} Performance relative to plain kernel routing (negative: slower): per-round paired relative difference over all 10 rounds, including kernel routing's outlier round~8, mean $\pm$ 95\% CI (paired $t$). Axis from -45 to 65\,\%.}\label{fig:app-vskernel}
 \end{minipage}
 \hfill
 \begin{minipage}[t]{0.48\textwidth}\centering
@@ -159,7 +159,7 @@ Fig. & Name & Unit & Configurations \\
 \legend{VIP TCP, VIP 64-B rate}
 \end{axis}
 \end{tikzpicture}
-\captionof{figure}{\textbf{Paired difference to OVS-ct.} VIP-path performance relative to OVS-ct: per-round paired relative difference, mean $\pm$ 95\% CI (paired $t$).}\label{fig:app-vsovs}
+\captionof{figure}{\textbf{Paired difference to OVS-ct.} VIP-path performance relative to OVS-ct: per-round paired relative difference, mean $\pm$ 95\% CI (paired $t$). Axis from -25 to 45\,\%.}\label{fig:app-vsovs}
 \end{minipage}
 \end{figure*}
 \begin{figure*}[!p]\centering
@@ -197,13 +197,13 @@ Fig. & Name & Unit & Configurations \\
 \begin{tikzpicture}
 \begin{axis}[ybar, width=\linewidth, height=4.3cm, bar width=7pt,
   scaled y ticks=false, yticklabel style={/pgf/number format/fixed},
-  symbolic x coords={Pass,FW drop,DNAT est.,SNAT est.}, xtick=data, ymin=50, ymax=350,
+  symbolic x coords={Pass,FW drop,DNAT est.,SNAT est.}, xtick=data, ymin=50, ymax=250,
   ylabel={ns per packet (single-shot)}, enlarge x limits=0.08, axis lines*=left,
   ymajorgrids, grid style={gray!25}, x tick label style={rotate=30, anchor=east, font=\tiny},
   y tick label style={font=\tiny}, label style={font=\scriptsize},
   error bars/y dir=both, error bars/y explicit, bar width=8pt, legend style={font=\tiny, at={(0.5,1.02)}, anchor=south, legend columns=2, draw=none}]
-\addplot[fill=blue!55, draw=black!60, error bars/.cd, y dir=both, y explicit, error mark options={rotate=90, mark size=1.5pt}] coordinates {(Pass,153) +- (0,1.77) (FW drop,116.4) +- (0,4.87) (DNAT est.,217.4) +- (0,4.32) (SNAT est.,275.5) +- (0,13.3)};
-\addplot[fill=teal!55, draw=black!60, error bars/.cd, y dir=both, y explicit, error mark options={rotate=90, mark size=1.5pt}] coordinates {(Pass,180.6) +- (0,17.8) (FW drop,154.8) +- (0,9.36) (DNAT est.,245.6) +- (0,10.4) (SNAT est.,196.8) +- (0,4.73)};
+\addplot[fill=blue!55, draw=black!60, error bars/.cd, y dir=both, y explicit, error mark options={rotate=90, mark size=1.5pt}] coordinates {(Pass,152.2) +- (0,8.34) (FW drop,111.8) +- (0,6.16) (DNAT est.,214.5) +- (0,12.5) (SNAT est.,187.1) +- (0,10.8)};
+\addplot[fill=teal!55, draw=black!60, error bars/.cd, y dir=both, y explicit, error mark options={rotate=90, mark size=1.5pt}] coordinates {(Pass,158.2) +- (0,9.54) (FW drop,117.9) +- (0,4.96) (DNAT est.,213.8) +- (0,11.5) (SNAT est.,191.4) +- (0,8.3)};
 \legend{XDP, TC}
 \end{axis}
 \end{tikzpicture}
@@ -212,33 +212,33 @@ Fig. & Name & Unit & Configurations \\
 \hfill
 \begin{minipage}[t]{0.48\textwidth}\centering
 \begin{tikzpicture}
-\begin{axis}[width=\linewidth, height=4.3cm, scaled y ticks=false, symbolic x coords={1,1k,15k,60k,60k}, xtick=data, ymin=50, ymax=650, ylabel={ns per packet},
+\begin{axis}[width=\linewidth, height=4.3cm, scaled y ticks=false, symbolic x coords={1,1k,15k,60k}, xtick=data, ymin=0, ymax=950, ylabel={ns per packet},
   axis lines*=left, ymajorgrids, grid style={gray!25}, tick label style={font=\tiny}, label style={font=\scriptsize},
   legend style={font=\tiny, at={(0.02,0.98)}, anchor=north west, draw=none}]
-\addplot[blue!70, mark=*, mark size=1.4pt, error bars/.cd, y dir=both, y explicit] coordinates {(1,132) +- (0,2.08) (1k,233.9) +- (0,47.6) (15k,523.8) +- (0,61.4) (60k,455.1) +- (0,9.57)};
-\addplot[teal!80!black, mark=square*, mark size=1.4pt, error bars/.cd, y dir=both, y explicit] coordinates {(1,119.8) +- (0,1.13) (1k,238.4) +- (0,82.8) (15k,290.3) +- (0,17.9) (60k,435.1) +- (0,5.83)};
+\addplot[blue!70, mark=*, mark size=1.4pt, error bars/.cd, y dir=both, y explicit] coordinates {(1,126.4) +- (0,1.85) (1k,447.8) +- (0,41.8) (15k,512.6) +- (0,34.8) (60k,813.9) +- (0,21.6)};
+\addplot[teal!80!black, mark=square*, mark size=1.4pt, error bars/.cd, y dir=both, y explicit] coordinates {(1,115.5) +- (0,2.61) (1k,238.5) +- (0,65.1) (15k,345.2) +- (0,54.3) (60k,770.4) +- (0,43.2)};
 \legend{XDP, TC}
 \end{axis}
 \end{tikzpicture}
-\captionof{figure}{\textbf{Cache-cold cost.} In-kernel single-shot cost versus the number of tracked flows visited in random order (cache-cold, empty rule tables; 15k flows fit the 16\,384-entry telemetry table, 60k do not); mean $\pm$ 95\% CI of 10 batch means.}\label{fig:app-cold}
+\captionof{figure}{\textbf{Cache-cold cost.} In-kernel single-shot cost versus the number of tracked flows visited in random order (cache-cold, empty rule tables; 15k flows fit the 16\,384-entry telemetry table, 60k do not); mean $\pm$ 95\% CI of 10 batch means, first of three runs. Axis starts at 0.}\label{fig:app-cold}
 \end{minipage}
 \par\vspace{2mm}
 \begin{minipage}[t]{0.48\textwidth}\centering
 \begin{tikzpicture}
 \begin{axis}[ybar, width=\linewidth, height=4.3cm, bar width=7pt,
   scaled y ticks=false, yticklabel style={/pgf/number format/fixed},
-  symbolic x coords={Pass,DNAT est.,SNAT est.}, xtick=data, ymin=100, ymax=350,
+  symbolic x coords={Pass,DNAT est.,SNAT est.}, xtick=data, ymin=100, ymax=300,
   ylabel={ns per packet (single-shot)}, enlarge x limits=0.08, axis lines*=left,
   ymajorgrids, grid style={gray!25}, x tick label style={rotate=30, anchor=east, font=\tiny},
   y tick label style={font=\tiny}, label style={font=\scriptsize},
   error bars/y dir=both, error bars/y explicit, bar width=8pt, legend style={font=\tiny, at={(0.5,1.02)}, anchor=south, legend columns=3, draw=none}]
-\addplot[fill=blue!55, draw=black!60, error bars/.cd, y dir=both, y explicit, error mark options={rotate=90, mark size=1.5pt}] coordinates {(Pass,153) +- (0,1.77) (DNAT est.,217.4) +- (0,4.32) (SNAT est.,275.5) +- (0,13.3)};
-\addplot[fill=orange!65, draw=black!60, error bars/.cd, y dir=both, y explicit, error mark options={rotate=90, mark size=1.5pt}] coordinates {(Pass,198.5) +- (0,3.37) (DNAT est.,284.5) +- (0,3.25) (SNAT est.,257.4) +- (0,5.84)};
-\addplot[fill=teal!55, draw=black!60, error bars/.cd, y dir=both, y explicit, error mark options={rotate=90, mark size=1.5pt}] coordinates {(Pass,257.6) +- (0,7.43) (DNAT est.,309.4) +- (0,9.74) (SNAT est.,256.3) +- (0,2.87)};
+\addplot[fill=blue!55, draw=black!60, error bars/.cd, y dir=both, y explicit, error mark options={rotate=90, mark size=1.5pt}] coordinates {(Pass,152.2) +- (0,8.34) (DNAT est.,214.5) +- (0,12.5) (SNAT est.,187.1) +- (0,10.8)};
+\addplot[fill=orange!65, draw=black!60, error bars/.cd, y dir=both, y explicit, error mark options={rotate=90, mark size=1.5pt}] coordinates {(Pass,206.5) +- (0,13.5) (DNAT est.,258.4) +- (0,13.8) (SNAT est.,227.2) +- (0,9.98)};
+\addplot[fill=teal!55, draw=black!60, error bars/.cd, y dir=both, y explicit, error mark options={rotate=90, mark size=1.5pt}] coordinates {(Pass,205.3) +- (0,8.43) (DNAT est.,259.1) +- (0,8.68) (SNAT est.,232.5) +- (0,6.34)};
 \legend{single program, chain (re-parse), chain (shared metadata)}
 \end{axis}
 \end{tikzpicture}
-\captionof{figure}{\textbf{Tail-call ablation.} Tail-call ablation (XDP, single-shot): single program versus the same stages chained with tail calls, re-parsing in every stage or sharing the parse result through a per-CPU map; mean $\pm$ 95\% CI of 10 batch means. Axis starts at 100.}\label{fig:app-chain}
+\captionof{figure}{\textbf{Tail-call ablation.} Tail-call ablation (XDP, single-shot): single program versus the same stages chained with tail calls, re-parsing in every stage or sharing the parse result through a per-CPU map; mean $\pm$ 95\% CI of 10 batch means, first of three runs. Axis starts at 100.}\label{fig:app-chain}
 \end{minipage}
 \hfill
 \begin{minipage}[t]{0.48\textwidth}\centering
@@ -250,10 +250,10 @@ Fig. & Name & Unit & Configurations \\
   ymajorgrids, grid style={gray!25}, x tick label style={rotate=30, anchor=east, font=\tiny},
   y tick label style={font=\tiny}, label style={font=\scriptsize},
   error bars/y dir=both, error bars/y explicit, ymode=log, log origin=infty]
-\addplot[fill=violet!50, draw=black!60, error bars/.cd, y dir=both, y explicit, error mark options={rotate=90, mark size=1.5pt}] coordinates {(XDP est.,217.4) +- (0,4.32) (XDP new TCP,1548) +- (0,254) (XDP new UDP,2154) +- (0,438) (TC est.,245.6) +- (0,10.4) (TC new TCP,1654) +- (0,303) (TC new UDP,2021) +- (0,253)};
+\addplot[fill=violet!50, draw=black!60, error bars/.cd, y dir=both, y explicit, error mark options={rotate=90, mark size=1.5pt}] coordinates {(XDP est.,214.5) +- (0,12.5) (XDP new TCP,2147) +- (0,290) (XDP new UDP,1996) +- (0,326) (TC est.,213.8) +- (0,11.5) (TC new TCP,2037) +- (0,271) (TC new UDP,1909) +- (0,346)};
 \end{axis}
 \end{tikzpicture}
-\captionof{figure}{\textbf{New-connection cost.} In-kernel single-shot cost of DNAT for an established connection, a new TCP connection (SYN: no reverse-entry probes) and a new UDP flow (probes the $n=4$ reverse entries of the pool); mean $\pm$ 95\% CI of 10 batch means. Logarithmic axis.}\label{fig:app-newconn}
+\captionof{figure}{\textbf{New-connection cost.} In-kernel single-shot cost of DNAT for an established connection, a new TCP connection (the SYN deletes the $n=4$ reverse entries of the pool) and a new UDP flow (probes them); mean $\pm$ 95\% CI of 10 batch means, first of three runs. Logarithmic axis.}\label{fig:app-newconn}
 \end{minipage}
 \end{figure*}
 \clearpage  % flush the figure pages before the references

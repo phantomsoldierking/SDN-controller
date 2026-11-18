@@ -11,7 +11,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 
-from ..abi import Action, FwKey, FwKind, FwMask, FwRule, Proto
+from ..abi import Action, FlowKey, FwKey, FwKind, FwMask, FwRule, Proto
 from ..codec import (bytes_to_mac, ip_to_wire, mac_to_bytes, parse_proto, port_to_wire,
                      proto_name, wire_to_ip, wire_to_port)
 from ..maps import MapBackend
@@ -28,6 +28,10 @@ _IP_PATTERNS = {
     (True, False, False, False, False): FwMask.IP_SRC,
     (False, True, False, False, False): FwMask.IP_DST,
 }
+# Lookup order of the IP patterns and the fields each one keeps (bpf/firewall.h)
+_IP_ORDER = [(mask, fields) for fields, mask in
+             sorted(_IP_PATTERNS.items(), key=lambda item: item[1])]
+_PORT_MASKS = {FwMask.IP_EXACT, FwMask.IP_DPORT, FwMask.IP_SPORT, FwMask.SVC_PORT}
 SUPPORTED_IP_PATTERNS = (
     "src+dst+proto+sport+dport, src+dst+proto+dport, src+dst+proto+sport, src+dst+proto, "
     "src+dst, dst+proto+dport (any source), src, dst")
@@ -115,6 +119,7 @@ def describe_key(k: FwKey, rule: FwRule) -> dict:
 class Firewall:
     def __init__(self, maps: dict[str, MapBackend], lock: threading.RLock, conntrack, config):
         self._rules, self._lock = maps["firewall_map"], lock
+        self._services = maps.get("lb_services")
         self._conntrack, self._config = conntrack, config
 
     def _sync_pattern_mask(self) -> None:
@@ -124,6 +129,29 @@ class Firewall:
             mask |= 1 << k.mask
         self._config.set_pattern_mask(mask)
 
+    def decide(self, k: FlowKey) -> Action:
+        """The data plane's rule decision A(k) for an IPv4 flow key: the first
+        installed pattern that matches, in lookup order (bpf/firewall.h
+        fw_ip_lookup); port patterns need a port-carrying TCP/UDP key."""
+        has_ports = k.proto in (Proto.TCP, Proto.UDP) and bool(k.sport or k.dport)
+        for mask, (s, d, sp, dp, p) in _IP_ORDER:
+            if mask in _PORT_MASKS and not has_ports:
+                continue
+            fk = FwKey(kind=FwKind.IP, mask=mask, proto=k.proto if p else 0,
+                       saddr=k.saddr if s else 0, daddr=k.daddr if d else 0,
+                       sport=k.sport if sp else 0, dport=k.dport if dp else 0)
+            rule = self._rules.lookup(fk)
+            if rule is not None:
+                return Action(rule.action)
+        return Action.NONE
+
+    def _flush_dropped(self) -> int:
+        """A new DROP rule must not be bypassed by established state: remove the
+        state of exactly those connections whose rule decision is now DROP."""
+        vips = ({(k.vip, k.port, k.proto) for k in self._services.keys()}
+                if self._services is not None else set())
+        return self._conntrack.flush_dropped(lambda k: self.decide(k) == Action.DROP, vips)
+
     def add(self, rule: FirewallRule) -> int:
         keys = rule.keys()
         action = parse_action(rule.action)
@@ -131,15 +159,14 @@ class Firewall:
             for k in keys:
                 self._rules.update(k, FwRule(action=action))
             self._sync_pattern_mask()
-            if action == Action.DROP:
-                # A new DROP rule must not be bypassed by already-established state.
-                self._conntrack.flush_matching(
-                    [(k.saddr, k.daddr) for k in keys if k.kind == FwKind.IP])
+            if action == Action.DROP and not rule.is_mac:
+                self._flush_dropped()
         return len(keys)
 
     def add_many(self, rules: list[FirewallRule]) -> int:
-        """Install many rules with a single pattern-mask update (bulk loading)."""
-        n = 0
+        """Install many rules with a single pattern-mask update and one state
+        flush (bulk loading)."""
+        n, drop = 0, False
         with self._lock:
             for rule in rules:
                 action = parse_action(rule.action)
@@ -147,10 +174,10 @@ class Firewall:
                 for k in keys:
                     self._rules.update(k, FwRule(action=action))
                 n += len(keys)
-                if action == Action.DROP:
-                    self._conntrack.flush_matching(
-                        [(k.saddr, k.daddr) for k in keys if k.kind == FwKind.IP])
+                drop |= action == Action.DROP and not rule.is_mac
             self._sync_pattern_mask()
+            if drop:
+                self._flush_dropped()
         return n
 
     def delete(self, rule: FirewallRule) -> int:

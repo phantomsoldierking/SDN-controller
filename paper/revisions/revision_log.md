@@ -10,7 +10,9 @@ Stateful Firewalling and L4 Load Balancing Compared with Open vSwitch
 | Initial draft | `paper/versions/v0_draft.pdf` | Round 1 |
 | Revision 1 | `paper/versions/v1_revision1.pdf` | Round 2 |
 | Revision 2 | `paper/versions/v2_revision2.pdf` | Round 3 |
-| Revision 3 | `paper/versions/v3_revision3.pdf` | Round 4 (recommended) |
+| Revision 3 | `paper/versions/v3_revision3.pdf` | Round 4 (the draft `v3_revision3_draft.pdf` was uploaded by mistake) |
+| Revision 4 | `paper/versions/v4_revision4.pdf` | Round 5 |
+| Revision 5 | `paper/versions/v5_revision5.pdf` | Round 6 (recommended) |
 
 ---
 
@@ -267,3 +269,124 @@ rounds). The user additionally asked for 12–14 supplementary figures with
 - Microbenchmark (`results/rev3/microbench.json`): rules, conntrack, cold (1/1k/15k/60k), paths incl. new TCP/UDP, two chained variants, uniformity, reaper.
 - Environment: `results/rev3/environment.txt`.
 - Paper: `paper/versions/v3_revision3.pdf` (16 pages incl. 4-page figure appendix) and `.tex` (+ `v3_revision3_appendix_figs.tex`).
+
+
+---
+
+## Round 4: review of Revision 3 → Revision 4 (v4)
+
+Full reviewer output: `paper/revisions/round4_comments.md`
+
+**Important:** the file reviewed in this round was the layout draft
+`v3_revision3_draft.pdf` (built from Revision 2 data, before the Revision 3
+results were written in), not `v3_revision3.pdf`. Many comments therefore
+describe gaps that the final Revision 3 had already closed; they are listed
+as "already addressed". The remaining comments were checked against the code
+and fixed where valid. Experiments were not re-run: the fixes concern rare
+cases (reused client ports, state recovery) and the control plane, and add at
+most a flag test to the measured paths.
+
+### A. Already addressed in Revision 3 (draft-only gaps)
+
+| # | Reviewer comment (summary) | Status |
+|---|---|---|
+| R4.W1 / R4.E1 | nft-FT and the five "+rules" variants defined but not reported | Reported in Revision 3: Tables II–IV, Fig. 2, §VI-C (flowtable and populated-rule paragraphs), Figs. 8–9, abstract, conclusion |
+| R4.E2 | Shared-metadata chain, new-UDP DNAT and 1k/15k cold points not reported | Reported in Revision 3: Table V (both chain variants, DNAT new UDP), §VI-E, Figs. 15–17 |
+| R4.W5 / R4.E3 | Test counts 44/85 vs 41/75 | Unified (now 48 unit + 95 kernel = 143, 142 pass, 1 skip) |
+| R4.E4 | Paired tests declared, Welch reported | Revision 3 reports paired tests throughout §VI and states where pairing changes borderline p-values |
+| R4.m | TODOENTRIES/TODOSWEEP placeholders | Filled in Revision 3 (608 entries, ≈3 ms) |
+| R4.m | Table III post-drain p column | Added in Revision 3 |
+| R4.m | Fig. 13 axis clips CI | Panel no longer in the appendix (connection sweep is Fig. 3); every appendix axis is derived from the CI bounds |
+| R4.m | Fig. 17 caption "where measured" | Fig. 17 shows new UDP flows; caption updated |
+| R4.F.m | Abstract "13.6–26.9% of throughput" mixes metrics | Sentence removed in Revision 3's abstract |
+
+### B. Valid comments fixed in this round
+
+| # | Reviewer comment (summary) | Response and changes | Type |
+|---|---|---|---|
+| R4.P2 | DROP-rule flush matches addresses only and breaks permitted connections on other ports or exempted by a higher-priority ALLOW | **Fixed in code.** `Firewall.decide()` reproduces the data plane's first-match decision; `ConnTrack.flush_dropped()` removes exactly the entries whose decision is now DROP (L and T_rev by the client-visible key κ, reconstructed from the stored VIP for T_rev; routed T_fw entries in both orientations; VIP entries only in κ). Tests: `test_port_drop_rule_flushes_only_its_port`, `test_higher_priority_allow_exempts_connection_from_flush`, `test_routed_drop_rule_in_reply_orientation_flushes_entry`. §IV-E rewritten | Code, Text |
+| R4.P3(1,2) | SYN reusing a port matches L[f] in place even on a draining backend, and inherits FIN/RST flags and creation time | **Fixed in code.** `lb_syn_restarts`: a SYN (no ACK) that hits an entry that has seen FIN/RST or whose backend is draining deletes the old reverse entry and is placed afresh; a retransmitted SYN of a live connection keeps its backend. `ct_touch` restarts a firewall entry on a SYN after FIN/RST (deleting a reverse-orientation entry). Tests: `test_syn_on_draining_backend_entry_is_placed_afresh`, `test_syn_after_fin_restarts_connection_state`, `test_retransmitted_syn_keeps_live_connection` | Code, Text |
+| R4.P3(3) | Coexisting reverse entries; recovery could pick a stale one | **Fixed in code.** Recovery probes all n slots and restores the most recently seen entry (`test_recovery_prefers_most_recent_reverse_entry`). Replies never overwrite an existing L entry (verified in code), so a late reply from the old backend cannot rebind the connection | Code, Text |
+| R4.P3(4) | Forward recovery does not refresh T_rev | **Fixed in code** (`rev_store(..., 0)` after recovery; `test_recovery_refreshes_reverse_entry`) | Code, Text |
+| R4.P1 | SELECT behaviour on a cleared active flag; transient list states during multi-syscall updates | Verified in code: `lb_select` continues cyclically to the next active backend. §IV-E and Alg. 2 now specify this and describe the transient states (duplicate entry on drain, overwritten slot on restore): no connection is placed on a draining backend or dropped; the choice among active backends can deviate for microseconds; a single map value would make it atomic | Text |
+| R4.P4 | First-fragment ports, priority inversion, non-first fragments | Verified in code: both directions are checked against E with the raw first-fragment ports kept apart from f, and the drop uses the full first-match decision, so an m6/m7 ALLOW wins over m8 DROP (no inversion). Text and Alg. 1 now say so; the limitation that non-first fragments are judged port-less (orphan fragments may carry a backend address and create port-less state) is stated | Text |
+| R4.M1 | DROP invariant asymmetric for routed traffic | §III-D: directional rules match as packets travel; the opposite direction is blocked only via the state flush (δ = DROP); bidirectional rules for both directions | Text |
+| R4.M2 | Non-SYN packets create state; "seen a reply" mark unused; half-close timeout | §III-D: admission is flag-independent by design (enables recovery), unlike nf_conntrack's strict mode; REPLY mark is observability only; §III-F: half-close shortens the timeout, no TCP state machine; lost connections re-select the same backend unless the pool changed | Text |
+| R4.M3 | Disjoint pools preclude sharing a backend endpoint across VIPs | Stated in §III-F (one port per service) | Text |
+| R4.F1 | TSS characterization | §II, §III-C and conclusion: constant bound follows from whole-field masks without prefixes | Text |
+| R4.m | a(·) undefined; I₄ shorthand; σ overloaded; E value tuple; Alg. 2 uses x | a(i,m_i(·)) defined; I₄(0) = {6,7,9,10} written out; σ as numeric identifier stated; E value written as 4-tuple; Alg. 2 takes `syn` from Parse | Text |
+
+### C. Not changed
+
+| # | Comment | Reason |
+|---|---|---|
+| R4.W2 | Incremental novelty vs Cilium/KFuse/Morpheus | Already positioned in §II (contribution is the formally specified coupling and the stateful comparison); Revision 3 results now show the single-program benefit is modest |
+| R4.W4 | veth limitations | Stated in §VI-F/G; physical NICs remain future work |
+| R4.E5 | No external eBPF framework benchmarked | Out of scope; the two-variant tail-call ablation and +rules runs are reported instead (§II, §VI-E) |
+
+### Summary of new evidence in Revision 4
+
+- Automated tests: 143 (48 unit, 95 kernel = 47 cases × 2 hooks + 1 chain-equivalence test); 142 pass, 1 skipped (TC truncated frame). Run in the privileged test container.
+- Measurements unchanged from Revision 3 (`results/rev3/`).
+- Paper: `paper/versions/v4_revision4.pdf` (17 pages) and `.tex` (+ `v4_revision4_appendix_figs.tex`).
+
+---
+
+## Round 5: review of Revision 4 → Revision 5 (v5)
+
+Full reviewer output: `paper/revisions/round5_comments.md`
+
+The reviewer confirmed that all Round 4 comments on framing, model,
+algorithms and references were addressed and the citation check verified
+every reference. The remaining comments were checked against the code and
+the data. Two data-plane corner cases were valid and fixed in code, and the
+in-kernel microbenchmark was re-run on the final binary (three independent
+runs, interleaved, SMT sibling offline). The re-run changed two conclusions
+of Revision 4 (tail-call cost when cached; new TCP vs. new UDP cost), which
+the paper now reports.
+
+### A. Valid comments fixed in this round
+
+| # | Reviewer comment (summary) | Response and changes | Type |
+|---|---|---|---|
+| R5.M-P1 | A SYN reusing a port after L[f] was evicted leaves the old T_rev entry, so a late reply from the old backend can still match it | **Fixed in code.** Before selecting a backend, a TCP SYN deletes T_rev[r_bi(f)] for every backend of the pool (`lb_clear_stale_rev`). Test: `test_syn_after_lost_forward_entry_clears_stale_reverse_entry`. §III-F, §IV-F complexity (n deletions per SYN) and Alg. 2 updated | Code, Text |
+| R5.M-P2 | Restarting L[f] on a draining backend without FIN/RST does not reset the T_fw entry | **Fixed in code.** The load balancer marks a freshly placed connection (`verdict.fresh`), and `ct_touch` restarts the firewall entry when the flag is set (deleting a reverse-orientation entry). Test: `test_syn_off_draining_backend_restarts_firewall_entry`. §III-D updated | Code, Text |
+| R5.E1 / W2 | Benchmarks predate the fixes; microbenchmark should be re-run on the final binary | **Re-run.** `run_microbench.sh` runs the tests, then three independent microbenchmark runs of the final binary (`results/rev4/microbench_{1,2,3}.json`; summary: `testbed/microbench_summary.py`). Table V, Fig. 3, §VI-E, abstract, contribution 1 and conclusion now report the mean of the three run means with the lowest–highest run mean. §V-C states that the macro-benchmarks predate the fixes, which on the measured paths add only flag tests and, for a new TCP connection, the reverse-entry deletions | Experiment, Text |
+| R5.E2 | Batch drift: 115 ns XDP pass outlier, 275 ns XDP SNAT, TC conntrack and 15k cold points; suggests interleaving and SMT sibling offline | **Done.** `testbed/microbench.py` measures all paths and both chain variants interleaved (one batch/sample of each in turn) and takes CPU 0's SMT sibling offline for the run (restored on exit, including SIGTERM/SIGHUP). The 115 ns pass (now 87–92 ns), the 275 ns SNAT (now 184–187 ns) and the TC conntrack points (now 74–78 ns) are not reproduced. Timing overhead is now 57–68 ns (pass) and 45–53 ns (drop) at both hooks. Run-to-run ranges (up to 64 ns hot, 440 ns cold) exceed within-run CIs and are reported in §VI-E and §VI-G | Experiment, Text |
+| R5.E3 | nft+IPVS "+rules" VIP path bypasses the forward-chain rules | Noted in §V-A and as a Table IV footnote: the VIP columns of nft+IPVS +rules are not a like-for-like rule-evaluation comparison | Text |
+| R5.m | Table V lacks a single-shot Drop column | Added (Table V now has repeat-loop Pass/Drop and single-shot Pass/Drop/DNAT est./new TCP/new UDP/SNAT est.) | Text |
+| R5.m | Fig. 15 axis origin and lower CI cap; Fig. 10 caption "Cost" sign ambiguity | Every appendix caption states its axis origin (Fig. 15 now starts at 0); Fig. 10 caption reads "Performance relative to plain kernel routing (negative: slower)" and states that it covers all 10 rounds including kernel round 8 | Text |
+| R5.E4 | §VI-C kernel comparison vs. Fig. 10 | Verified: Fig. 10's nft+IPVS value is −20.3 ± 13.5 % (all 10 rounds), matching the text; the reviewer read the bar at about −13 %. §VI-C now also gives the all-round nft-FT value (+20.0 ± 32.2 %, p = 0.19) next to the 9-round sensitivity value and points to Fig. 10 | Text |
+
+### B. Results of the microbenchmark re-run (changes to the paper's claims)
+
+| Quantity | Revision 4 (one run) | Revision 5 (three runs, range of run means) |
+|---|---|---|
+| Admitted packet, empty tables (XDP / TC) | 68 / 78 ns | 67–70 / 74–76 ns |
+| All ten patterns populated (XDP / TC) | 224–270 / 236–247 ns | 218–270 / 229–299 ns; 15–18 ns per pattern |
+| Tracked connections 0–60k | XDP 69–73 ns; TC 78–106 ns | XDP 67–72 ns (one outlier 92 ns); TC 74–78 ns |
+| Cache-cold, 1k–60k flows | 0.23–0.52 µs | 0.20–0.91 µs (run-to-run up to 440 ns) |
+| Drop, repeat loop | 60–67 ns | 60–74 ns |
+| DNAT est. / SNAT est. over pass | 64–65 / 16 ns (XDP SNAT 275 ns) | 51–67 / 31–40 ns at both hooks |
+| New TCP vs. new UDP | UDP 0.4–0.6 µs more | TCP 0.13–0.28 µs more (SYN deletes n reverse entries) |
+| Tail-call chain, repeat loop (pass) | nothing measurable | +22–30 ns (+25–34 %) |
+| Tail-call chain, single-shot | pass +46, DNAT +67 ns; SNAT −18 ns | pass +54–59, DNAT +43–47, SNAT +39–45 ns |
+| Shared-metadata vs. re-parsing chain | shared slower (pass 258 vs 199 ns) | equal (−8 to +5 ns) |
+| Chained drop | −8 to +12 ns | −7 to −9 ns (consistently cheaper) |
+| Reaper sweep, 3×60k entries | 0.84 s | 0.78–0.80 s |
+
+### C. Not changed
+
+| # | Comment | Reason |
+|---|---|---|
+| R5.W1 | Incremental novelty; per-packet lookups without a verdict cache | Positioning in §II unchanged; the verdict cache remains future work (§VI-F, §VII) |
+| R5.W3 | veth testbed limitations | Stated in §VI-G; physical NICs remain future work |
+| R5.E1 (macro) | Re-run the macro-benchmarks on the final binary | Not re-run: on the measured paths the fixes add only flag tests and SYN-only deletions, whose cost the microbenchmark now quantifies (§V-C) |
+
+### Summary of new evidence in Revision 5
+
+- Automated tests: 147 (48 unit, 99 kernel = 49 cases × 2 hooks + 1 chain-equivalence test); 146 pass, 1 skipped (TC truncated frame). Run in the privileged test container, on the host and by `run_microbench.sh` before each benchmark.
+- Microbenchmark: `results/rev4/microbench_{1,2,3}.json` (final binary, interleaved, SMT sibling offline, performance governor). Macro-benchmarks unchanged (`results/rev3/`).
+- Tooling: `run_microbench.sh`, `testbed/microbench_summary.py`; `paper/make_figures.py` takes the microbenchmark file as a second argument.
+- Paper: `paper/versions/v5_revision5.pdf` (18 pages) and `.tex` (+ `v5_revision5_appendix_figs.tex`).
+

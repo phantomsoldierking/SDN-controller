@@ -130,13 +130,17 @@ static __always_inline void rev_store(const struct flow_key *fwd, const struct l
 /*
  * The forward entry of an established connection was lost (LRU eviction or a
  * reaper race) but its reverse entry survives: find the backend that holds it
- * and restore the binding, even if that backend is draining. Probes at most
- * n <= 16 reverse keys; skipped for TCP SYNs, which always open a new
- * connection (so a stale reverse entry cannot capture a reused port).
+ * and restore the binding, even if that backend is draining. Probes all
+ * n <= 16 reverse keys and takes the most recently seen entry, so a leftover
+ * entry of an earlier connection with the same tuple cannot win over the live
+ * one. Skipped for TCP SYNs, which always open a new connection.
  */
 static __always_inline int lb_recover_forward(struct pkt *p, struct svc_info *svc,
 					      struct lb_ct *out)
 {
+	__u64 best = 0;
+	int found = -1;
+
 	for (__u32 i = 0; i < MAX_BACKENDS_PER_SVC; i++) {
 		if (i >= svc->count)
 			break;
@@ -151,15 +155,51 @@ static __always_inline int lb_recover_forward(struct pkt *p, struct svc_info *sv
 		struct lb_rev *rev = bpf_map_lookup_elem(&lb_reverse, &rk);
 
 		if (rev && rev->vip == p->key.daddr && rev->vport == p->key.dport &&
-		    rev->be_idx == i) {
+		    rev->be_idx == i && (found < 0 || rev->last_seen_ns > best)) {
+			best = rev->last_seen_ns;
+			found = (int)i;
 			out->backend_ip = be->ip;
 			out->backend_port = port;
 			out->svc_id = (__u8)svc->id;
 			out->be_idx = (__u8)i;
-			return 0;
 		}
 	}
-	return -1;
+	return found < 0 ? -1 : 0;
+}
+
+/* A SYN opens a new connection while L[f] is missing or restarted: delete
+ * every reverse entry that an earlier connection with the same tuple left
+ * behind (probes n <= 16 keys), so a late packet from its backend can no
+ * longer be translated and no stale entry coexists with the new one. */
+static __always_inline void lb_clear_stale_rev(struct pkt *p, struct svc_info *svc)
+{
+	for (__u32 i = 0; i < MAX_BACKENDS_PER_SVC; i++) {
+		if (i >= svc->count)
+			break;
+		struct backend *be = backend_at(svc->id, i);
+
+		if (!be || !be->ip)
+			continue;
+		struct flow_key rk;
+
+		reply_key(&p->key, be->ip, backend_port(be, p->key.dport), &rk);
+		bpf_map_delete_elem(&lb_reverse, &rk);
+	}
+}
+
+/* A SYN that hits the forward entry of an earlier connection with the same
+ * tuple starts a new connection if that one has ended (FIN/RST seen) or its
+ * backend is draining; a retransmitted SYN of a live connection keeps it. */
+static __always_inline int lb_syn_restarts(const struct pkt *p, const struct lb_ct *ct)
+{
+	struct backend *be;
+
+	if (!tcp_opening(p))
+		return 0;
+	if (ct->flags & (CT_F_FIN | CT_F_RST))
+		return 1;
+	be = backend_at(ct->svc_id, ct->be_idx);
+	return !be || !be->active;
 }
 
 /*
@@ -167,7 +207,9 @@ static __always_inline int lb_recover_forward(struct pkt *p, struct svc_info *sv
  * backend even after it is drained; they are re-placed only if the backend
  * was removed or replaced, in which case its stale reverse entry is deleted.
  * Existing entries are updated in place (creation time and flags are kept);
- * only new or recovered connections insert entries. Returns 1 to drop.
+ * only new or recovered connections insert entries. A TCP SYN that reuses the
+ * tuple of an ended connection, or of one on a draining backend, is placed as
+ * a new connection with fresh entries. Returns 1 to drop.
  */
 static __always_inline int lb_forward(struct pkt *p, struct svc_info *svc, struct verdict *v,
 				      __u64 now)
@@ -184,7 +226,7 @@ static __always_inline int lb_forward(struct pkt *p, struct svc_info *svc, struc
 
 	if (ct) {
 		if (lb_slot_holds(ct->svc_id, ct->be_idx, ct->backend_ip, ct->backend_port,
-				  p->key.dport)) {
+				  p->key.dport) && !lb_syn_restarts(p, ct)) {
 			ct->last_seen_ns = now;
 			ct->packets += 1;
 			ct->bytes += p->len;
@@ -192,13 +234,15 @@ static __always_inline int lb_forward(struct pkt *p, struct svc_info *svc, struc
 			rev_store(&p->key, ct, now, flags, 0);
 			goto dnat;
 		}
-		/* backend removed or replaced: drop its reverse entry, re-place */
+		/* backend removed or replaced, or a SYN restarts the tuple: drop the
+		 * old reverse entry and place the connection afresh */
 		struct flow_key old;
 
 		reply_key(&p->key, ct->backend_ip, ct->backend_port, &old);
 		bpf_map_delete_elem(&lb_reverse, &old);
 	} else if (!tcp_opening(p) && lb_recover_forward(p, svc, &nct) == 0) {
 		bpf_map_update_elem(&lb_conntrack, &p->key, &nct, BPF_ANY);
+		rev_store(&p->key, &nct, now, flags, 0); /* refresh the surviving half */
 		stat_add(STAT_LB_RECOVERED, 1);
 		ct = &nct;
 		goto dnat;
@@ -207,6 +251,10 @@ static __always_inline int lb_forward(struct pkt *p, struct svc_info *svc, struc
 	struct backend *be = 0;
 	__u32 idx = 0;
 
+	if (tcp_opening(p)) {
+		lb_clear_stale_rev(p, svc);
+		v->fresh = 1;
+	}
 	if (lb_select(svc, flow_hash(&p->key), &idx, &be) < 0 || !be) {
 		stat_add(STAT_DROP_NO_BACKEND, 1);
 		return 1;

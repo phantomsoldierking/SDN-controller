@@ -119,24 +119,37 @@ static __always_inline __u32 fw_ip_lookup(const struct flow_key *f, int has_port
  * `is_reply` marks load-balanced replies, whose k is already the client->VIP
  * orientation. */
 static __always_inline void ct_touch(const struct flow_key *k, struct pkt *p, __u64 now,
-				     int is_reply)
+				     int is_reply, int fresh)
 {
 	struct ct_entry *ct = bpf_map_lookup_elem(&fw_conntrack, k);
 	__u32 extra = is_reply ? CT_F_REPLY : 0;
+	struct flow_key rk;
+	int on_rev = 0;
 
 	if (!ct) {
-		struct flow_key rk;
-
 		reverse_key(k, &rk);
 		ct = bpf_map_lookup_elem(&fw_conntrack, &rk);
 		extra = CT_F_REPLY;
+		on_rev = 1;
 	}
 	if (ct) {
-		ct->last_seen_ns = now;
-		ct->packets += 1;
-		ct->bytes += p->len;
-		ct->flags |= extra | tcp_ct_flags(p);
-		return;
+		/* restart on a SYN after FIN/RST, or when the load balancer has
+		 * just placed this SYN as a new connection (e.g. off a draining
+		 * backend), so all three tables start the connection together */
+		int restart = fresh || ((ct->flags & (CT_F_FIN | CT_F_RST)) &&
+			      p->key.proto == IPPROTO_TCP_ && (p->tcp_flags & 0x12) == 0x02);
+
+		if (!restart) {
+			ct->last_seen_ns = now;
+			ct->packets += 1;
+			ct->bytes += p->len;
+			ct->flags |= extra | tcp_ct_flags(p);
+			return;
+		}
+		/* a SYN reuses the tuple of an ended connection: start afresh
+		 * (creation time, counters and flags) under the packet's key */
+		if (on_rev)
+			bpf_map_delete_elem(&fw_conntrack, &rk);
 	}
 
 	struct ct_entry nct = {

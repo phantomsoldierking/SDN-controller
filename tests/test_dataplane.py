@@ -99,6 +99,50 @@ class FirewallTest(unittest.TestCase):
         dp.firewall.add(FirewallRule(src=C1, dst=S3, action="allow"))
         self.assertEqual(len(dp.maps["fw_conntrack"].keys()), 1)
 
+    def _vip_conn(self, dp, client_port: int, vport: int = 80):
+        """A load-balanced connection c1 -> VIP:vport served by s2, in all three tables."""
+        fwd = flow_key(C1, VIP, client_port, vport, 6)
+        dp.maps["lb_conntrack"].update(fwd, abi.LbCt(
+            backend_ip=ip_to_wire(S2), backend_port=port_to_wire(vport)))
+        dp.maps["lb_reverse"].update(flow_key(S2, C1, vport, client_port, 6),
+                                     abi.LbRev(vip=ip_to_wire(VIP), vport=port_to_wire(vport)))
+        dp.maps["fw_conntrack"].update(fwd, abi.CtEntry())
+
+    def _tables(self, dp):
+        return [len(dp.maps[m].keys()) for m in ("lb_conntrack", "lb_reverse", "fw_conntrack")]
+
+    def test_port_drop_rule_flushes_only_its_port(self):
+        """A port-specific DROP rule removes the state of the connections it
+        drops, not of other connections between the same addresses."""
+        dp = new_dp()
+        dp.lb.add_service(VIP, 80, [S2])
+        dp.lb.add_service(VIP, 8080, [S3])
+        self._vip_conn(dp, 40000)            # c1 -> VIP:80, stays permitted
+        dp.firewall.add(FirewallRule(src=C1, dst=VIP, proto="tcp", dport=8080))
+        self.assertEqual(self._tables(dp), [1, 1, 1])
+        dp.firewall.add(FirewallRule(dst=VIP, proto="tcp", dport=80))
+        self.assertEqual(self._tables(dp), [0, 0, 0])
+
+    def test_higher_priority_allow_exempts_connection_from_flush(self):
+        dp = new_dp()
+        dp.lb.add_service(VIP, 80, [S2])
+        self._vip_conn(dp, 40000)
+        dp.firewall.add(FirewallRule(src=C1, dst=VIP, proto="tcp", dport=80, action="allow"))
+        dp.firewall.add(FirewallRule(dst=VIP))     # m10 DROP, lower priority than m4
+        self.assertEqual(self._tables(dp), [1, 1, 1])
+        self.assertEqual(dp.firewall.decide(flow_key(C1, VIP, 40000, 80, 6)), abi.Action.ALLOW)
+        self.assertEqual(dp.firewall.decide(flow_key(C1, VIP, 40000, 81, 6)), abi.Action.DROP)
+
+    def test_routed_drop_rule_in_reply_orientation_flushes_entry(self):
+        """Routed traffic is matched as it travels, so a rule on the reply
+        orientation (s3 -> c1) also removes the shared entry (c1 -> s3)."""
+        dp = new_dp()
+        fw_ct = dp.maps["fw_conntrack"]
+        fw_ct.update(flow_key(C1, S3, 40000, 22, 6), abi.CtEntry())
+        fw_ct.update(flow_key(C1, S3, 40001, 80, 6), abi.CtEntry())
+        dp.firewall.add(FirewallRule(src=S3, dst=C1, proto="tcp", sport=22))
+        self.assertEqual([(k.dport) for k in fw_ct.keys()], [port_to_wire(80)])
+
 
 class PatternMaskTest(unittest.TestCase):
     def test_mask_tracks_populated_patterns(self):

@@ -111,7 +111,7 @@ static __always_inline int chain_stage_out(struct chain_ctx *st, struct pkt *p, 
 	__u64 now = bpf_ktime_get_ns();
 
 	if (cfg && (cfg->flags & CFG_F_FW_STATEFUL))
-		ct_touch(&st->ck, p, now, st->kind == LB_REPLY);
+		ct_touch(&st->ck, p, now, st->kind == LB_REPLY, st->v.fresh);
 	telemetry(p, now);
 	struct verdict v = st->v;
 

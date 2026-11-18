@@ -40,6 +40,7 @@ struct verdict {
 	__u32 new_addr;
 	__u16 old_port;
 	__u16 new_port;
+	__u32 fresh; /* a SYN opened a new load-balanced connection */
 };
 
 enum parse_rc {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the appendix figures (pgfplots) from a results directory.
 
-    python3 paper/make_figures.py results/rev3 > paper/appendix_figs.tex
+    python3 paper/make_figures.py results/rev3 [results/rev4/microbench_1.json] > paper/appendix_figs.tex
 
 Every plot shows means with 95% confidence intervals (Student t). Value axes
 are zoomed (they do not start at zero) so that the intervals are visible;
@@ -146,7 +146,7 @@ def paired_bars(out, configs, ref, metrics, ylabel, caption):
     for pts, color, _ in series:
         body += bars(pts, color)
     body += "\\legend{" + ", ".join(s[2] for s in series) + "}\n"
-    return panel(body, caption)
+    return panel(body, caption + f" Axis from {ymin:g} to {ymax:g}\\,\\%.")
 
 
 def micro_line(mb, section, xs, xlabels, ylabel, caption, logx=False):
@@ -173,7 +173,7 @@ def micro_line(mb, section, xs, xlabels, ylabel, caption, logx=False):
             f" label style={{font=\\scriptsize}},\n"
             f"  legend style={{font=\\tiny, at={{(0.02,0.98)}}, anchor=north west, draw=none}}]\n"
             + plots + "\\legend{XDP, TC}\n")
-    return panel(body, caption)
+    return panel(body, caption + f" Axis starts at {ymin:g}.")
 
 
 def micro_paths(mb, caption):
@@ -243,14 +243,21 @@ def micro_hooks(mb, caption):
 
 def main() -> int:
     out = sys.argv[1] if len(sys.argv) > 1 else "results/rev3"
-    with open(os.path.join(out, "microbench.json")) as f:
+    mb_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(out, "microbench.json")
+    with open(mb_path) as f:
         mb = json.load(f)
     n = len(load(out, "ebpf-tc"))
     ci = f"mean $\\pm$ 95\\% CI over {n} interleaved rounds."
     src = lambda c: f"\\texttt{{{os.path.basename(os.path.normpath(out))}/{c}}}"  # noqa: E731
-    run, mbs = src("<cfg>.json"), src("microbench.json")
+    run = src("<cfg>.json")
+    mb_rel = os.path.relpath(mb_path, os.path.dirname(os.path.normpath(out))).replace("_", "\\_")
+    mbs = f"\\texttt{{{mb_rel}}}"
     cold_x = ["one_flow", "1000", "15000", "60000", "many_flows"]
-    cold_l = ["1", "1k", "15k", "60k", f"{mb['hooks']['xdp'].get('flows', 60000) // 1000}k"]
+    cold_data = mb["hooks"]["xdp"].get("cold", {})
+    cold_x = [x for x in cold_x if x in cold_data]
+    names = {"one_flow": "1", "1000": "1k", "15000": "15k", "60000": "60k",
+             "many_flows": f"{mb['hooks']['xdp'].get('flows', 60000) // 1000}k"}
+    cold_l = [names[x] for x in cold_x]
     figs = [
         named(config_bars(out, BASE, "tcp_gbps", 1, "TCP (Gbit/s)",
                           f"Routed-path TCP throughput, {ci}"),
@@ -275,8 +282,9 @@ def main() -> int:
         named(paired_bars(out, BASE, "kernel",
                           [("tcp_gbps", "blue!55", "TCP"), ("udp64_rx_pps", "teal!55", "64-B rate")],
                           "difference to Kernel (\\%)",
-                          "Cost relative to plain kernel routing: per-round paired relative "
-                          "difference, mean $\\pm$ 95\\% CI (paired $t$)."),
+                          "Performance relative to plain kernel routing (negative: slower): "
+                          "per-round paired relative difference over all 10 rounds, including "
+                          "kernel routing's outlier round~8, mean $\\pm$ 95\\% CI (paired $t$)."),
               "fig:app-vskernel", "Paired difference to Kernel", "\\%", "all", run),
         named(paired_bars(out, LB, "ovs-ct",
                           [("tcp_vip_gbps", "orange!65", "VIP TCP"),
@@ -298,7 +306,7 @@ def main() -> int:
                          ["0", "1k", "10k", "60k"], "ns per packet",
                          "In-kernel cost of an admitted packet versus tracked connections per "
                          "table (empty rule tables), zoomed view of Fig.~\\ref{fig:scale}; "
-                         "mean $\\pm$ 95\\% CI of 15 repeat-loop samples."),
+                         "mean $\\pm$ 95\\% CI of 15 repeat-loop samples, first of three runs."),
               "fig:app-conntrack", "Connection-table scaling", "ns", "XDP, TC", mbs),
         named(micro_hooks(mb, "In-kernel single-shot cost per processing path at the XDP and "
                               "TC hooks with one installed rule; mean $\\pm$ 95\\% CI of 10 "
@@ -308,17 +316,17 @@ def main() -> int:
                          "In-kernel single-shot cost versus the number of tracked flows visited "
                          "in random order (cache-cold, empty rule tables; 15k flows fit the "
                          "16\\,384-entry telemetry table, 60k do not); mean $\\pm$ 95\\% CI "
-                         "of 10 batch means."),
+                         "of 10 batch means, first of three runs."),
               "fig:app-cold", "Cache-cold cost", "ns", "XDP, TC", mbs),
         named(micro_paths(mb, "Tail-call ablation (XDP, single-shot): single program versus "
                               "the same stages chained with tail calls, re-parsing in every "
                               "stage or sharing the parse result through a per-CPU map; "
-                              "mean $\\pm$ 95\\% CI of 10 batch means."),
+                              "mean $\\pm$ 95\\% CI of 10 batch means, first of three runs."),
               "fig:app-chain", "Tail-call ablation", "ns", "XDP", mbs),
         named(micro_new_conn(mb, "In-kernel single-shot cost of DNAT for an established "
-                                 "connection, a new TCP connection (SYN: no reverse-entry probes) "
-                                 "and a new UDP flow (probes the $n=4$ reverse entries of the "
-                                 "pool); mean $\\pm$ 95\\% CI of 10 batch means."),
+                                 "connection, a new TCP connection (the SYN deletes the $n=4$ "
+                                 "reverse entries of the pool) and a new UDP flow (probes them); "
+                                 "mean $\\pm$ 95\\% CI of 10 batch means, first of three runs."),
               "fig:app-newconn", "New-connection cost", "ns", "XDP, TC", mbs),
     ]
     figs = [f for f in figs if f]
@@ -336,7 +344,10 @@ def main() -> int:
           "measurements behind Tables~\\ref{tab:perf} and \\ref{tab:paths} with their 95\\% "
           "confidence intervals (Student $t$). Value axes are zoomed so that the intervals are "
           "visible; each caption gives the axis origin, and differences between bars should be "
-          "judged against the intervals, not against the axis origin. "
+          "judged against the intervals, not against the axis origin. In-kernel panels show the "
+          "first of the three microbenchmark runs with its within-run intervals; "
+          "Table~\\ref{tab:paths} and Fig.~\\ref{fig:scale} give the mean and range over all "
+          "three. "
           f"Table~\\ref{{tab:figindex}} lists every figure with its quantity, the "
           f"configurations it covers and its data file in the results directory "
           f"(\\texttt{{{os.path.normpath(out)}}}).\n")

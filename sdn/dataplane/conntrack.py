@@ -57,22 +57,36 @@ class ConnTrack:
         with self._lock:
             return sum(m.delete(k) for m in (self._fw, self._lb, self._rev) for k in m.keys())
 
-    def flush_matching(self, addr_pairs: list[tuple[int, int]]) -> int:
-        """Delete entries whose client-visible (saddr, daddr) match any pair; 0 is
-        a wildcard. Reverse-NAT entries are judged by the VIP they stand for."""
-        if not addr_pairs:
-            return 0
+    def flush_dropped(self, dropped, vips: set[tuple[int, int, int]]) -> int:
+        """Delete the state of connections whose rule decision is now DROP.
 
-        def hit(s_addr: int, d_addr: int) -> bool:
-            return any(s in (0, s_addr) and d in (0, d_addr) for s, d in addr_pairs)
-
+        `dropped(k)` evaluates the rule decision A(k) for a client-visible key;
+        `vips` holds the (address, port, protocol) of every service.
+        Load-balanced connections are judged only by their client-visible key
+        kappa (reverse entries are mapped back to it from the VIP they store),
+        as the data plane judges both of their directions. A routed connection
+        is judged in both orientations, because each direction is matched as
+        it travels: if either is now dropped, the shared entry must go so that
+        the other direction is no longer admitted as established."""
         n = 0
         with self._lock:
-            for m in (self._fw, self._lb):
-                n += sum(m.delete(k) for k in m.keys() if hit(k.saddr, k.daddr))
+            for k in self._lb.keys():
+                if dropped(k):
+                    n += self._lb.delete(k)
             for k, v in self._rev.items():
-                if hit(v.vip, k.daddr) or hit(k.daddr, v.vip):
+                client = FlowKey(saddr=k.daddr, daddr=v.vip, sport=k.dport, dport=v.vport,
+                                 proto=k.proto, l3=L3.IPV4)
+                if dropped(client):
                     n += self._rev.delete(k)
+            for k in self._fw.keys():
+                if (k.daddr, k.dport, k.proto) in vips:
+                    hit = dropped(k)
+                else:
+                    rk = FlowKey(saddr=k.daddr, daddr=k.saddr, sport=k.dport, dport=k.sport,
+                                 proto=k.proto, l3=k.l3)
+                    hit = dropped(k) or dropped(rk)
+                if hit:
+                    n += self._fw.delete(k)
         return n
 
     def flush_backend(self, ip: int, port: int, proto: int) -> int:

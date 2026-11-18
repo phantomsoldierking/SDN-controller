@@ -105,7 +105,7 @@ static __always_inline int pipeline(void *data, void *data_end, struct pkt *p,
 		return 0;
 	}
 	if (cfg && (cfg->flags & CFG_F_FW_STATEFUL))
-		ct_touch(&ck, p, now, kind == LB_REPLY);
+		ct_touch(&ck, p, now, kind == LB_REPLY, v->fresh);
 	telemetry(p, now);
 	return 0;
 }
